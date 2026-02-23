@@ -224,4 +224,14 @@ If you use this work, please cite:
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+Copyright (c) 2026 Badaramoni Avinash. All rights reserved.
+
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
+
+This means:
+- You **must** open-source any modified version or derivative work under the same license
+- You **must** disclose the source code if you run a modified version as a network service
+- You **must** provide attribution to the original author
+- Commercial use requires compliance with all AGPL-3.0 terms
+
+See [LICENSE](LICENSE) for the full text.
