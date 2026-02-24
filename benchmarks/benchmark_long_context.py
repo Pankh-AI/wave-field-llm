@@ -435,17 +435,10 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = device.type == 'cuda'
-
-    # TF32 for Ampere+ GPUs: ~2x speedup on fp32 matmul/FFT operations
-    if device.type == 'cuda':
-        torch.set_float32_matmul_precision('high')
-        torch.backends.cudnn.benchmark = True
-
     print(f"\n  Device: {device}")
     if device.type == 'cuda':
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-        print(f"  TF32: enabled | cudnn.benchmark: enabled")
 
     tok, train_ids, val_ids = load_cached_data(vocab_size=8000)
     vocab_size = tok.vocab_size_actual()
