@@ -44,12 +44,43 @@ import torch.nn.functional as F
 import math
 
 
+def _next_fast_size(n):
+    """Find smallest m >= n whose prime factors are all <= 7 (cuFFT sweet spot).
+
+    cuFFT has optimized radix-2/3/5/7 kernels. Sizes with larger prime factors
+    fall back to slower Bluestein/Rader algorithms. Padding to a "fast" size
+    avoids 2-5x slowdowns for unlucky field sizes.
+    """
+    while True:
+        m = n
+        for p in (2, 3, 5, 7):
+            while m % p == 0:
+                m //= p
+        if m == 1:
+            return n
+        n += 1
+
+
+class ELUPlus1(nn.Module):
+    """elu(x) + 1: always positive, no dead neurons, smooth gradient everywhere.
+
+    Standard activation for linear attention feature maps (Katharopoulos et al., 2020).
+    Unlike ReLU which permanently kills ~50% of neurons, ELU+1 has non-zero gradient
+    for all inputs: f'(x) = 1 for x>0, f'(x) = exp(x) for x<0.
+    """
+
+    def forward(self, x):
+        return F.elu(x) + 1.0
+
+
 class LearnedFeatureMap(nn.Module):
     """Learned positive feature map for linear attention (Hedgehog, ICLR 2024).
 
-    MLP of `depth` identity-initialized Linear(d,d) + ReLU layers.
-    At init: phi(x) = ReLU(ReLU(...(Ix))) = ReLU(x) + eps — tokens distinct from step 1.
+    MLP of `depth` identity-initialized Linear(d,d) + ELU+1 layers.
+    At init: phi(x) = ELU(Ix)+1 — always positive, no dead neurons.
     During training: learns spiky, dot-product-monotonic maps that mimic softmax.
+
+    V4.3.2: Replaced ReLU with ELU+1 to fix 35-55% dead neuron problem.
 
     depth=1: original V4.3 (single linear).
     depth=2: Hedgehog-style (closes 68.6% of linear-vs-softmax gap at 125M scale).
@@ -65,7 +96,7 @@ class LearnedFeatureMap(nn.Module):
                 nn.init.eye_(lin.weight)
                 nn.init.zeros_(lin.bias)
             layers.append(lin)
-            layers.append(nn.ReLU())
+            layers.append(ELUPlus1())
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -137,7 +168,11 @@ class WaveFieldAttention(nn.Module):
 
     def __init__(self, embedding_dim, num_heads, field_size=512, max_seq_len=128,
                  n_components=1, local_window=0, use_analytic_kernel=True,
-                 feature_map_depth=2, device='cuda'):
+                 feature_map_depth=2, use_write_gate=True,
+                 use_3d_interference=False,
+                 use_kernel_mixture=False, num_basis_kernels=4,
+                 layer_idx=0, num_layers=1,
+                 device='cuda'):
         super().__init__()
 
         self.embedding_dim = embedding_dim
@@ -148,6 +183,12 @@ class WaveFieldAttention(nn.Module):
         self.n_components = n_components
         self.local_window = local_window
         self.use_analytic_kernel = use_analytic_kernel
+        self.use_write_gate = use_write_gate
+        self.use_3d_interference = use_3d_interference
+        self.use_kernel_mixture = use_kernel_mixture
+        self.num_basis_kernels = num_basis_kernels
+        self.layer_idx = layer_idx
+        self.num_layers = num_layers
         self.device = device
 
         assert embedding_dim % num_heads == 0
@@ -166,30 +207,92 @@ class WaveFieldAttention(nn.Module):
         self.q_feature_map = LearnedFeatureMap(self.head_dim, depth=feature_map_depth)
         self.k_feature_map = LearnedFeatureMap(self.head_dim, depth=feature_map_depth)
 
-        # V4.3: Content-adaptive spectral gate (SPECTRE-style)
-        # rfft(n=2*G) produces G+1 complex frequency bins
-        self.freq_bins = field_size + 1
-        self.spectral_gate = SpectralGate(
-            num_heads=num_heads,
-            head_dim=self.head_dim,
-            freq_bins=self.freq_bins,
-            n_control=32,
-        )
+        # V4.4: Selective write gate (GLA-inspired)
+        # Controls per-token, per-head write strength to wave field.
+        # Input is raw K (mean-zero at init) → sigmoid(0) = 0.5 (neutral).
+        if use_write_gate:
+            self.write_gate_proj = nn.Linear(self.head_dim, 1, bias=True)
+
+        # Pad to cuFFT-friendly size (prime factors <= 7)
+        self._fast_pad_size = _next_fast_size(2 * field_size)
+        # rfft(n=pad) produces pad//2 + 1 complex frequency bins
+        self.freq_bins = self._fast_pad_size // 2 + 1
+
+        if use_kernel_mixture:
+            # Content-Adaptive Kernel Mixture: K basis kernels, per-token mixing
+            # Replaces SpectralGate with per-token (not per-sample) adaptivity
+            K = num_basis_kernels
+            H = num_heads
+
+            # Multi-scale HiPPO init: spread frequencies and dampings across K scales
+            hippo_base = torch.tensor([math.pi * (2 * n + 1) / 2 for n in range(H)])
+            freq_scales = torch.tensor([0.5, 1.0, 2.0, 4.0][:K])
+            damp_raw = torch.tensor([-1.5, -0.69, 0.0, 0.69][:K])
+            phase_base = torch.linspace(0, math.pi, H)
+
+            self.basis_frequency = nn.Parameter(
+                hippo_base.unsqueeze(1) * freq_scales.unsqueeze(0)  # (H, K)
+            )
+            self.basis_damping = nn.Parameter(
+                damp_raw.unsqueeze(0).expand(H, K).clone()  # (H, K)
+            )
+            self.basis_phase = nn.Parameter(
+                phase_base.unsqueeze(1).expand(H, K).clone()  # (H, K)
+            )
+
+            # Per-token mixing: q @ mix_proj -> (B, H, N, K) weights
+            # Zero init for projection (content-dependent deviation)
+            self.kernel_mix_proj = nn.Parameter(torch.zeros(H, self.head_dim, K))
+
+            # Bias: strongly prefer basis 1 (standard HiPPO) at init
+            # softmax([0, 5, 0, 0]) ≈ [0.5%, 97.9%, 0.5%, 0.5%]
+            # This gives a coherent starting point (like V4.3 single kernel)
+            # Training gradually shifts weight to other kernels per-token
+            bias_init = torch.zeros(K)
+            if K > 1:
+                bias_init[1] = 5.0  # basis 1 = 1.0x HiPPO (standard)
+            self.kernel_mix_bias = nn.Parameter(
+                bias_init.unsqueeze(0).expand(H, K).clone()  # (H, K)
+            )
+
+            self.spectral_gate = None
+        else:
+            # V4.3: Content-adaptive spectral gate (SPECTRE-style)
+            self.spectral_gate = SpectralGate(
+                num_heads=num_heads,
+                head_dim=self.head_dim,
+                freq_bins=self.freq_bins,
+                n_control=32,
+            )
 
         # ---- WAVE KERNEL PARAMETERS ----
         H = num_heads
         C = n_components
 
         if C == 1:
-            # V4.3: HiPPO-inspired init (S4D, arXiv:2206.11893)
-            # Uniform damping: all heads decay equally (not linspace!)
-            # Harmonic frequencies: ω_n = π(2n+1)/2 — optimal for long-range deps
-            hippo_freq = torch.tensor([math.pi * (2 * n + 1) / 2 for n in range(H)])
-            hippo_damp = torch.full((H,), -0.69)  # softplus(-0.69) ≈ 0.5 = uniform
+            # V4.3.2: Per-layer HiPPO init with diversity (S4D, arXiv:2206.11893)
+            # Early layers: low freq (broad patterns), low damping (long reach)
+            # Later layers: high freq (sharp local), high damping (fast decay)
+            # This forces layers to specialize from step 0 instead of all starting identical.
+            layer_frac = layer_idx / max(num_layers - 1, 1)  # 0.0 to 1.0
+
+            # Frequency: 0.5x HiPPO (L0) to 2.0x HiPPO (last layer)
+            freq_scale = 0.5 * (4.0 ** layer_frac) if num_layers > 1 else 1.0
+            hippo_freq = torch.tensor(
+                [math.pi * (2 * n + 1) / 2 for n in range(H)]
+            ) * freq_scale
+
+            # Damping: softplus(-1.4)=0.22 (L0, long reach) to softplus(0.0)=0.69 (last, local)
+            damp_raw = -1.4 + 1.4 * layer_frac if num_layers > 1 else -0.69
+            hippo_damp = torch.full((H,), damp_raw)
+
+            # Phase: offset per layer for inter-layer diversity
+            phase_offset = (math.pi / max(num_layers, 1)) * layer_idx
+            hippo_phase = torch.linspace(0, math.pi, H) + phase_offset
 
             self.wave_frequency = nn.Parameter(hippo_freq)
             self.wave_damping = nn.Parameter(hippo_damp)
-            self.wave_phase = nn.Parameter(torch.linspace(0, math.pi, H))
+            self.wave_phase = nn.Parameter(hippo_phase)
             self.component_weights = None
         else:
             # Multi-component wavelet: (H, C) params with multi-resolution init
@@ -236,10 +339,18 @@ class WaveFieldAttention(nn.Module):
         else:
             self.local_blend = None
 
-        # Static multi-field coupling
+        # Static multi-field coupling (used when 3D interference is off)
         self.field_coupling = nn.Parameter(
             torch.eye(H) + torch.randn(H, H) * 0.01
         )
+
+        # V4.4: 3D wave interference — content-dependent cross-head mixing
+        # Replaces static field_coupling with physics-based interference
+        if use_3d_interference:
+            self.head_positions = nn.Parameter(
+                self._init_head_positions(H)
+            )
+            self.token_pos_proj = nn.Linear(embedding_dim, 3)
 
         # Fixed stride for absolute position mapping
         self.register_buffer(
@@ -302,7 +413,7 @@ class WaveFieldAttention(nn.Module):
         kernel_sum = kernels.abs().sum(dim=1, keepdim=True).clamp(min=1e-8)
         kernels = kernels / kernel_sum
 
-        result = torch.fft.rfft(kernels, n=2 * G)
+        result = torch.fft.rfft(kernels, n=self._fast_pad_size)
 
         # Cache (eval only — training invalidates every step + breaks checkpointing)
         if not self.training:
@@ -345,8 +456,8 @@ class WaveFieldAttention(nn.Module):
                     return self._kernel_fft_cache
 
         G = self.field_size
-        pad_size = 2 * G
-        freq_bins = G + 1  # rfft output size for n=2*G
+        pad_size = self._fast_pad_size
+        freq_bins = self.freq_bins  # rfft output size for n=pad_size
 
         # Complex pole: lambda = -alpha + i*omega
         alpha = F.softplus(self.wave_damping)  # (H,) positive damping
@@ -409,6 +520,61 @@ class WaveFieldAttention(nn.Module):
 
         return kernel_fft
 
+    def _build_basis_kernel_ffts(self, device):
+        """Build K analytic kernel FFTs for Content-Adaptive Kernel Mixture.
+
+        Vectorized Z-transform: same math as _build_analytic_kernel_fft but
+        with (H, K) shaped poles. Returns (K, H, freq_bins) complex.
+        Causal by construction — no _enforce_causal_kernel needed.
+        """
+        G = self.field_size
+        pad_size = self._fast_pad_size
+        freq_bins = self.freq_bins
+
+        alpha = F.softplus(self.basis_damping)   # (H, K)
+        omega = self.basis_frequency              # (H, K)
+        phi = self.basis_phase                    # (H, K)
+
+        # Complex poles: lambda = -alpha + i*omega  (H, K)
+        lam = torch.complex(-alpha.float(), omega.float())
+        c = torch.complex(torch.cos(phi.float()), torch.sin(phi.float()))
+
+        # DFT frequency bins: z_k = exp(i * 2*pi*k / pad_size)
+        k_freq = torch.arange(freq_bins, device=device, dtype=torch.float32)
+        z = torch.exp(torch.complex(
+            torch.zeros_like(k_freq),
+            2.0 * math.pi * k_freq / pad_size
+        ))  # (freq_bins,)
+
+        # Broadcasting: (H, K, 1) x (1, 1, freq_bins)
+        exp_lam = torch.exp(lam).unsqueeze(2)        # (H, K, 1)
+        exp_lam_G = torch.exp(lam * G).unsqueeze(2)  # (H, K, 1)
+        c_bc = c.unsqueeze(2)                          # (H, K, 1)
+        z_bc = z.unsqueeze(0).unsqueeze(0)             # (1, 1, freq_bins)
+
+        z_inv = 1.0 / z_bc
+        z_inv_G = z_inv ** G
+
+        numerator = 1.0 - exp_lam_G * z_inv_G
+        denominator = 1.0 - exp_lam * z_inv
+        denom_safe = denominator + 1e-10 * (denominator.abs() < 1e-10).float()
+
+        H_z = numerator / denom_safe  # (H, K, freq_bins)
+
+        # Conjugate pole
+        H_z_conj = (1.0 - exp_lam_G.conj() * z_inv_G) / (
+            (1.0 - exp_lam.conj() * z_inv) + 1e-10 * ((1.0 - exp_lam.conj() * z_inv).abs() < 1e-10).float()
+        )
+
+        # Real kernel DFT
+        kernel_fft = c_bc * H_z + c_bc.conj() * H_z_conj  # (H, K, freq_bins)
+
+        # Normalize by DC
+        dc = kernel_fft[:, :, 0:1].real.abs().clamp(min=1e-8)
+        kernel_fft = kernel_fft / dc
+
+        return kernel_fft.permute(1, 0, 2)  # (K, H, freq_bins)
+
     def _enforce_causal_kernel(self, kernel_fft, G):
         """Project a frequency-domain kernel back to causal (zero for t >= G).
 
@@ -420,10 +586,24 @@ class WaveFieldAttention(nn.Module):
         kernel_fft: (..., freq_bins) complex — static (H,F) or adaptive (B,H,F)
         Returns: same shape, causal-projected.
         """
-        pad_size = 2 * G
-        kernel_td = torch.fft.irfft(kernel_fft, n=pad_size)  # (..., 2G)
+        pad_size = self._fast_pad_size
+        kernel_td = torch.fft.irfft(kernel_fft, n=pad_size)  # (..., pad_size)
         kernel_td[..., G:] = 0  # zero anti-causal half
         return torch.fft.rfft(kernel_td, n=pad_size)
+
+    @staticmethod
+    def _complex_mul_real(a_real, a_imag, b_real, b_imag):
+        """Complex multiply decomposed into real ops (Inductor-fusible).
+
+        (a + bi)(c + di) = (ac - bd) + (ad + bc)i
+
+        Inductor can't fuse complex*complex (opaque struct-of-arrays layout).
+        Decomposing into 4 real multiplies lets it fuse with surrounding ops.
+        """
+        return (
+            a_real * b_real - a_imag * b_imag,
+            a_real * b_imag + a_imag * b_real,
+        )
 
     def _wave_convolve(self, field, kernel_fft):
         """Per-head wave convolution via zero-padded FFT (linear convolution).
@@ -435,7 +615,7 @@ class WaveFieldAttention(nn.Module):
         CUDA broadcasting handles it, saving 16 MB allocation per layer.
         """
         B, H, G, D = field.shape
-        pad_size = 2 * G
+        pad_size = self._fast_pad_size
 
         # Enforce causality: spectral gate modulation can introduce anti-causal
         # components by breaking the Hilbert transform relationship. Project
@@ -450,12 +630,19 @@ class WaveFieldAttention(nn.Module):
         input_dtype = field_t.dtype
         field_fft = torch.fft.rfft(field_t.float(), n=pad_size)  # (B, D, H, freq)
 
+        # Decompose complex multiply into real ops for Inductor fusion
+        f_real, f_imag = field_fft.real, field_fft.imag
+
         if kernel_fft.dim() == 3:
             # Content-adaptive: (B, H, freq) → (B, 1, H, freq) broadcasts over D
-            convolved_fft = field_fft * kernel_fft.unsqueeze(1)
+            k_real = kernel_fft.real.unsqueeze(1)
+            k_imag = kernel_fft.imag.unsqueeze(1)
         else:
             # Static: (H, freq) broadcasts naturally over (B, D)
-            convolved_fft = field_fft * kernel_fft
+            k_real, k_imag = kernel_fft.real, kernel_fft.imag
+
+        out_real, out_imag = self._complex_mul_real(f_real, f_imag, k_real, k_imag)
+        convolved_fft = torch.complex(out_real, out_imag)
 
         convolved = torch.fft.irfft(convolved_fft, n=pad_size)[..., :G]  # (B, D, H, G)
         convolved = convolved.to(input_dtype)
@@ -508,6 +695,128 @@ class WaveFieldAttention(nn.Module):
         """Static multi-field coupling via einsum (avoids flatten + bmm + reshape)."""
         coupling = F.softmax(self.field_coupling, dim=-1)
         return torch.einsum('ij,bjgd->bigd', coupling, field)
+
+    def _kernel_mixture_forward(self, field, q, field_pos_float, x):
+        """Content-Adaptive Kernel Mixture: K basis convolutions, per-token mixing.
+
+        Each query token selects its own weighted mixture of K convolved fields.
+        Sequential loop over K kernels to save memory (reuses field_fft).
+
+        field: (B, H, G, D) — scattered deposit
+        q: (B, H, N, head_dim) — raw queries (pre-feature-map)
+        field_pos_float: (N,) — field positions for gather
+        x: (B, N, D) — original input (for 3D interference if enabled)
+        Returns: (B, H, N, D) — gathered output
+        """
+        B, H, G, D = field.shape
+        K = self.num_basis_kernels
+        N = q.shape[2]
+        pad_size = self._fast_pad_size
+
+        # 1. Build K basis kernel FFTs: (K, H, freq_bins)
+        basis_ffts = self._build_basis_kernel_ffts(field.device)
+
+        # 2. Per-token mixing weights: q @ mix_proj + bias -> softmax over K
+        # fp32 for numerical stability under AMP
+        # bias provides strong prior (98% on standard HiPPO at init)
+        # q @ mix_proj adds content-dependent deviation
+        alpha = torch.einsum('bhnd,hdk->bhnk', q.float(), self.kernel_mix_proj.float())
+        alpha = alpha + self.kernel_mix_bias.float().unsqueeze(0).unsqueeze(2)  # (1, H, 1, K)
+        alpha = F.softmax(alpha, dim=-1).to(field.dtype)  # (B, H, N, K)
+
+        # 3. Compute field FFT once (reused for all K kernels)
+        field_t = field.permute(0, 3, 1, 2).contiguous()  # (B, D, H, G)
+        input_dtype = field_t.dtype
+        field_fft = torch.fft.rfft(field_t.float(), n=pad_size)  # (B, D, H, freq)
+
+        # 4. Sequential convolution loop: convolve → couple → gather → accumulate
+        output = torch.zeros(B, H, N, D, device=field.device, dtype=input_dtype)
+
+        for m in range(K):
+            # Convolve with m-th basis kernel: (H, freq) static — broadcasts over (B, D)
+            convolved_fft = field_fft * basis_ffts[m]  # (B, D, H, freq)
+            convolved = torch.fft.irfft(convolved_fft, n=pad_size)[..., :G]
+            field_m = convolved.to(input_dtype).permute(0, 2, 3, 1)  # (B, H, G, D)
+
+            # Field coupling (shared across K)
+            if self.use_3d_interference:
+                field_m = self._apply_3d_interference(field_m, x)
+            else:
+                field_m = self._apply_field_coupling(field_m)
+
+            # Gather at token positions
+            gathered_m = self._bilinear_gather(field_m, field_pos_float)  # (B, H, N, D)
+
+            # Weight by per-token alpha and accumulate
+            output = output + alpha[:, :, :, m:m+1] * gathered_m
+
+        return output
+
+    @staticmethod
+    def _init_head_positions(H):
+        """Initialize head positions for maximum spatial diversity."""
+        if H == 8:
+            # Cube vertices — perfect spacing for 8 heads
+            return torch.tensor([
+                [-0.5, -0.5, -0.5], [-0.5, -0.5, 0.5],
+                [-0.5, 0.5, -0.5], [-0.5, 0.5, 0.5],
+                [0.5, -0.5, -0.5], [0.5, -0.5, 0.5],
+                [0.5, 0.5, -0.5], [0.5, 0.5, 0.5],
+            ], dtype=torch.float32)
+        else:
+            # Fibonacci sphere for arbitrary H
+            golden = (1 + 5 ** 0.5) / 2
+            i = torch.arange(H, dtype=torch.float32)
+            theta = 2 * math.pi * i / golden
+            phi = torch.acos(1 - 2 * (i + 0.5) / H)
+            return torch.stack([
+                torch.sin(phi) * torch.cos(theta),
+                torch.sin(phi) * torch.sin(theta),
+                torch.cos(phi),
+            ], dim=-1) * 0.5
+
+    def _apply_3d_interference(self, field, x):
+        """Content-dependent cross-head mixing via 3D wave interference.
+
+        Each head is a wave source at a learned 3D position. Token embeddings
+        are projected to 3D positions. The interference pattern between heads
+        (based on path differences to the reference point) determines coupling.
+
+        field: (B, H, G, D)
+        x: (B, N, D) — original input for content-dependent positions
+        Returns: (B, H, G, D)
+        """
+        B, H, G, D_field = field.shape
+
+        # Content-dependent 3D position (first token as reference, like SpectralGate)
+        tok_pos = self.token_pos_proj(x)     # (B, N, 3)
+        ref_pos = tok_pos[:, 0, :]           # (B, 3)
+        head_pos = self.head_positions       # (H, 3)
+
+        # Distance from reference point to each head source
+        dist = torch.norm(
+            ref_pos.unsqueeze(1) - head_pos.unsqueeze(0), dim=-1
+        )  # (B, H)
+
+        # Path difference between head pairs → interference
+        dist_i = dist.unsqueeze(2)  # (B, H, 1)
+        dist_j = dist.unsqueeze(1)  # (B, 1, H)
+        path_diff = (dist_i - dist_j).abs()  # (B, H, H)
+
+        # Per-head-pair wave params (pairwise average preserves head diversity)
+        alpha_h = F.softplus(self.wave_damping)    # (H,)
+        omega_h = self.wave_frequency.abs()        # (H,)
+        alpha_ij = (alpha_h.unsqueeze(0) + alpha_h.unsqueeze(1)) / 2  # (H, H)
+        omega_ij = (omega_h.unsqueeze(0) + omega_h.unsqueeze(1)) / 2  # (H, H)
+
+        # Interference: constructive when path_diff ≈ n*lambda, destructive otherwise
+        interference = (
+            torch.exp(-alpha_ij * path_diff)
+            * torch.cos(omega_ij * path_diff)
+        )  # (B, H, H)
+        coupling = F.softmax(interference, dim=-1)  # (B, H, H)
+
+        return torch.einsum('bij,bjgd->bigd', coupling, field)
 
     def _local_attention(self, q, k, v, N):
         """
@@ -563,24 +872,34 @@ class WaveFieldAttention(nn.Module):
         # K-WEIGHTED DEPOSIT: K modulates V per dimension (D-dim routing, not scalar!)
         deposit = k_feat * v  # (B, H, N, head_dim)
 
-        # SCATTER → MODULATE → CONVOLVE → COUPLE → GATHER
+        # V4.4: Selective write gate — per-token control of field contribution
+        # Gate input is raw K (mean-zero), not k_feat (post-ReLU, all positive)
+        if self.use_write_gate:
+            write_strength = torch.sigmoid(self.write_gate_proj(k))  # (B, H, N, 1)
+            deposit = deposit * write_strength
+
+        # SCATTER → CONVOLVE → COUPLE → GATHER
         field = self._bilinear_scatter(deposit, field_pos_float, B, H, G, head_dim, x.device)
 
-        # V4.3: Analytic kernel via Z-transform (S4D-style complex exponentials)
-        # computes DFT directly from poles — automatic causality, better gradients.
-        # Falls back to legacy time-domain rfft for multi-component or when disabled.
-        if self.use_analytic_kernel and self.n_components == 1:
-            base_kernel_fft = self._build_analytic_kernel_fft(x.device)
+        if self.use_kernel_mixture:
+            # Content-Adaptive Kernel Mixture: K basis convolutions, per-token mixing
+            gathered = self._kernel_mixture_forward(field, q, field_pos_float, x)
         else:
-            base_kernel_fft = self._build_wave_kernels(x.device)
+            # V4.3 path: single kernel with SpectralGate modulation
+            if self.use_analytic_kernel and self.n_components == 1:
+                base_kernel_fft = self._build_analytic_kernel_fft(x.device)
+            else:
+                base_kernel_fft = self._build_wave_kernels(x.device)
 
-        # V4.3: Content-adaptive spectral modulation (SPECTRE-style)
-        # MLP(mean(Q)) → per-head spectral gate → input-dependent kernel
-        kernel_fft = self.spectral_gate(q, base_kernel_fft)  # (B, H, freq_bins)
+            kernel_fft = self.spectral_gate(q, base_kernel_fft)  # (B, H, freq_bins)
+            field = self._wave_convolve(field, kernel_fft)
 
-        field = self._wave_convolve(field, kernel_fft)
-        field = self._apply_field_coupling(field)
-        gathered = self._bilinear_gather(field, field_pos_float)  # (B, H, N, head_dim)
+            if self.use_3d_interference:
+                field = self._apply_3d_interference(field, x)
+            else:
+                field = self._apply_field_coupling(field)
+
+            gathered = self._bilinear_gather(field, field_pos_float)  # (B, H, N, head_dim)
 
         # Q-WEIGHTED READING: Q selects which dimensions to use
         wave_output = q_feat * gathered  # (B, H, N, head_dim)

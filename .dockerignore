@@ -22,6 +22,10 @@ docs/papers/
 # Results (mounted as volume, not baked into image)
 results/
 
+# Model checkpoints (large, not needed in image)
+*.pt
+*.pth
+
 # Docker files (no need to copy themselves)
 Dockerfile
 docker-compose.yml
@@ -33,3 +37,6 @@ Thumbs.db
 
 # Claude
 .claude/
+
+# Legacy benchmarks (not run in Docker by default)
+benchmarks/legacy/

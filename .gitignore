@@ -1,37 +1,53 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-
 *.egg-info/
 dist/
 build/
 *.egg
 
+# Secrets
 .env
 *.pem
 *.key
 
+# Model checkpoints
 *.pt
 *.pth
 *.bin
 *.ckpt
 checkpoints/
 
+# Logs
 *.log
 
+# Notebooks (keep only the colab notebook)
 .ipynb_checkpoints/
 *.ipynb
 !wave_llm_colab.ipynb
 
+# Text files (keep requirements)
 *.txt
 !requirements.txt
-!README.md
 
+# IDE / OS
 .DS_Store
+Thumbs.db
 .vscode/
 .idea/
+*.swp
+*.swo
 
+# Experiment tracking
 wandb/
 runs/
 outputs/
+
+# Results (generated, not source — volume-mounted in Docker)
+results/
+
+# Data caches
+data-cache/
+.cache/

@@ -71,7 +71,11 @@ class WaveFieldTransformerLayer(nn.Module):
     def __init__(self, embedding_dim=256, num_heads=8, ffn_dim=1024,
                  field_size=512, max_seq_len=128, dropout=0.1,
                  n_components=1, local_window=0, use_analytic_kernel=True,
-                 feature_map_depth=2, device='cuda'):
+                 feature_map_depth=2, use_write_gate=True,
+                 use_3d_interference=False,
+                 use_kernel_mixture=False, num_basis_kernels=4,
+                 layer_idx=0, num_layers=1,
+                 device='cuda'):
         super().__init__()
 
         self.attention = WaveFieldAttention(
@@ -83,6 +87,12 @@ class WaveFieldTransformerLayer(nn.Module):
             local_window=local_window,
             use_analytic_kernel=use_analytic_kernel,
             feature_map_depth=feature_map_depth,
+            use_write_gate=use_write_gate,
+            use_3d_interference=use_3d_interference,
+            use_kernel_mixture=use_kernel_mixture,
+            num_basis_kernels=num_basis_kernels,
+            layer_idx=layer_idx,
+            num_layers=num_layers,
             device=device
         )
         
@@ -217,7 +227,11 @@ class WaveFieldTransformer(nn.Module):
                  device=None,
                  use_analytic_kernel=True,
                  feature_map_depth=2,
-                 residual_scale=False):
+                 residual_scale=False,
+                 use_write_gate=True,
+                 use_3d_interference=False,
+                 use_kernel_mixture=False,
+                 num_basis_kernels=4):
         super().__init__()
 
         self.vocab_size = vocab_size
@@ -230,14 +244,14 @@ class WaveFieldTransformer(nn.Module):
         self.device = device if device is not None else (
             'cuda' if torch.cuda.is_available() else 'cpu'
         )
-        
+
         # Embeddings
         self.token_embedding = nn.Embedding(vocab_size, embedding_dim)
         self.positional_encoding = SinusoidalPositionalEncoding(
             embedding_dim, max_cache=max_seq_len
         )
         self.dropout = nn.Dropout(dropout)
-        
+
         # Wave Field Transformer layers
         self.layers = nn.ModuleList([
             WaveFieldTransformerLayer(
@@ -251,9 +265,15 @@ class WaveFieldTransformer(nn.Module):
                 local_window=local_window,
                 use_analytic_kernel=use_analytic_kernel,
                 feature_map_depth=feature_map_depth,
+                use_write_gate=use_write_gate,
+                use_3d_interference=use_3d_interference,
+                use_kernel_mixture=use_kernel_mixture,
+                num_basis_kernels=num_basis_kernels,
+                layer_idx=layer_idx,
+                num_layers=num_layers,
                 device=self.device
             )
-            for _ in range(num_layers)
+            for layer_idx in range(num_layers)
         ])
         
         # Field Interference modules (inserted periodically)
@@ -309,9 +329,25 @@ class WaveFieldTransformer(nn.Module):
                             nn.init.eye_(module.weight)
                             nn.init.zeros_(module.bias)
 
-                # Spectral gate: restore near-zero output init
-                nn.init.normal_(attn.spectral_gate.net[-1].weight, 0, 0.001)
-                nn.init.zeros_(attn.spectral_gate.net[-1].bias)
+                # Spectral gate: restore near-zero output init (skip if kernel mixture)
+                if attn.spectral_gate is not None:
+                    nn.init.normal_(attn.spectral_gate.net[-1].weight, 0, 0.001)
+                    nn.init.zeros_(attn.spectral_gate.net[-1].bias)
+
+                # Kernel mixture: restore zero init for projection, warm bias for basis 1
+                if hasattr(attn, 'kernel_mix_proj'):
+                    attn.kernel_mix_proj.data.zero_()
+                if hasattr(attn, 'kernel_mix_bias'):
+                    K = attn.kernel_mix_bias.shape[-1]
+                    attn.kernel_mix_bias.data.zero_()
+                    if K > 1:
+                        attn.kernel_mix_bias.data[:, 1] = 5.0  # 98% on standard HiPPO
+
+                # V4.4: 3D interference — larger token position scale for
+                # spatial diversity (generic init gives std=0.02, too small)
+                if hasattr(attn, 'token_pos_proj'):
+                    nn.init.normal_(attn.token_pos_proj.weight, 0, 0.1)
+                    nn.init.zeros_(attn.token_pos_proj.bias)
 
         # V4.2-D: Residual scaling — scale down residual contribution at init
         # to stabilize deep networks (GPT-style 1/sqrt(2*num_layers)).
@@ -322,26 +358,66 @@ class WaveFieldTransformer(nn.Module):
                     layer.attention.out_proj.weight.mul_(scale)
                     layer.ffn[3].weight.mul_(scale)  # second Linear in FFN
 
-    def configure_optimizer(self, base_lr, weight_decay=0.01, qk_lr_mult=3.0):
-        """Create AdamW optimizer with elevated LR for QKV projection parameters.
+    def configure_optimizer(self, base_lr, weight_decay=0.01,
+                            qk_lr_mult=3.0, kernel_lr_mult=50.0):
+        """Create AdamW with per-group learning rates.
 
-        V4.2 ablation proved 3x LR on qkvg_proj gives -21% PPL improvement
-        by accelerating feature map escape from the uniform-routing plateau
-        (arXiv:2501.16265 plateau theory + GLA ICML 2024 separate param groups).
+        Three param groups (V4.3.2):
+        1. Other params: base_lr (default)
+        2. QKV projections: base_lr × 3 (V4.2 ablation: -21% PPL)
+        3. Kernel physics params: base_lr × 50, weight_decay=0
+           (S4/Mamba practice — monitor showed 27-80x gradient deficit)
         """
+        kernel_names = {'wave_frequency', 'wave_damping', 'wave_phase'}
+        kernel_params = []
         qk_params = []
         other_params = []
+
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'qkvg_proj' in name:
+            param_leaf = name.split('.')[-1]
+            if param_leaf in kernel_names:
+                kernel_params.append(param)
+            elif 'qkvg_proj' in name:
                 qk_params.append(param)
             else:
                 other_params.append(param)
+
         return torch.optim.AdamW([
-            {'params': other_params, 'lr': base_lr},
-            {'params': qk_params, 'lr': base_lr * qk_lr_mult},
-        ], weight_decay=weight_decay)
+            {'params': other_params, 'lr': base_lr, 'weight_decay': weight_decay},
+            {'params': qk_params, 'lr': base_lr * qk_lr_mult, 'weight_decay': weight_decay},
+            {'params': kernel_params, 'lr': base_lr * kernel_lr_mult, 'weight_decay': 0.0},
+        ])
+
+    def compile_model(self, mode='reduce-overhead'):
+        """Compile non-FFT submodules with torch.compile for Inductor fusion.
+
+        Call AFTER model.to(device) and _init_weights (both happen in __init__).
+        Only compiles code paths that Inductor handles well — FFN, LayerNorm,
+        and feature maps. The FFT path (complex tensors) is left uncompiled
+        because Inductor lacks complex tensor codegen (PyTorch issue #125718).
+
+        Args:
+            mode: 'default' (safest), 'reduce-overhead' (CUDA graphs),
+                  'max-autotune' (slow compile, fastest run)
+        Returns: self (for chaining)
+        """
+        if not hasattr(torch, 'compile'):
+            return self
+
+        for layer in self.layers:
+            layer.ffn = torch.compile(layer.ffn, mode=mode)
+            layer.norm1 = torch.compile(layer.norm1, mode=mode)
+            layer.norm2 = torch.compile(layer.norm2, mode=mode)
+            # Feature maps: ELU+1 + Linear — fully compile-safe
+            layer.attention.q_feature_map = torch.compile(
+                layer.attention.q_feature_map, mode=mode
+            )
+            layer.attention.k_feature_map = torch.compile(
+                layer.attention.k_feature_map, mode=mode
+            )
+        return self
 
     def forward(self, input_ids, labels=None, mask=None):
         """
@@ -420,8 +496,25 @@ if __name__ == '__main__':
     y = torch.randint(0, 256, (2, 100), device=device)
     
     logits, loss = model(x, labels=y)
-    
+
     print(f"Input:  {x.shape}")
     print(f"Logits: {logits.shape}")
     print(f"Loss:   {loss.item():.3f}")
     print("Wave Field Transformer works!")
+
+    # Test kernel mixture mode
+    print("\nTesting Kernel Mixture mode...")
+    model_km = WaveFieldTransformer(
+        vocab_size=256, embedding_dim=256, num_layers=6, num_heads=8,
+        ffn_dim=1024, field_size=512,
+        use_kernel_mixture=True, num_basis_kernels=4,
+        use_write_gate=False, device=device
+    ).to(device)
+    km_params = sum(p.numel() for p in model_km.parameters())
+    print(f"Params (kernel mixture): {km_params:,} (vs {param_count:,} SpectralGate)")
+    logits_km, loss_km = model_km(x, labels=y)
+    print(f"Loss:   {loss_km.item():.3f}")
+    # Verify mixing weights are zero-init
+    mix_max = model_km.layers[0].attention.kernel_mix_proj.abs().max().item()
+    print(f"kernel_mix_proj max: {mix_max:.6f} (should be 0)")
+    print("Kernel Mixture works!")

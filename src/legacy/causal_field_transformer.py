@@ -15,12 +15,12 @@ import os
 
 # Handle both direct execution and import
 if __name__ == '__main__':
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from src.causal_field_attention import CausalFieldAttentionV2
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from src.legacy.causal_field_attention import CausalFieldAttentionV2
     from src.global_context import GlobalContextModule
 else:
     from .causal_field_attention import CausalFieldAttentionV2
-    from .global_context import GlobalContextModule
+    from ..global_context import GlobalContextModule
 
 
 class SinusoidalPositionalEncoding(nn.Module):

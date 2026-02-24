@@ -4,10 +4,13 @@ Causality Test: Does changing a FUTURE token affect PAST token outputs?
 If yes → the model can see the future → explains 99% accuracy + garbage generation
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 import torch.nn.functional as F
 from src.wave_field_transformer import WaveFieldTransformer
-from field_tokenizer_v2 import FieldTokenizerV2
 
 
 def test_causality():

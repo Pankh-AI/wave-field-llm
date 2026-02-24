@@ -45,6 +45,15 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.wave_field_transformer import WaveFieldTransformer
 
+# Optional training monitor (disable with MONITOR=0)
+_monitor_available = False
+if os.environ.get('MONITOR', '1') != '0':
+    try:
+        from diagnostics.training_monitor import WaveFieldMonitor
+        _monitor_available = True
+    except ImportError:
+        pass
+
 
 # ======================================================================
 # STANDARD TRANSFORMER (baseline reference)
@@ -349,10 +358,31 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
     print(f"  Token budget: {total_token_budget:,} | Steps: {total_steps:,}")
     print(f"  Train chunks: {len(train_data):,} | Val chunks: {len(val_data):,}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=peak_lr, weight_decay=0.01, eps=1e-8)
+    # torch.compile: selective compilation of non-FFT submodules
+    if torch.cuda.is_available() and hasattr(model, 'compile_model'):
+        try:
+            model.compile_model(mode='reduce-overhead')
+            print("  torch.compile: enabled (reduce-overhead)")
+        except Exception as e:
+            print(f"  torch.compile: skipped ({e})")
+
+    # V4.3.2: Use per-group LR optimizer if available (kernel params at 50x LR)
+    if hasattr(model, 'configure_optimizer'):
+        optimizer = model.configure_optimizer(base_lr=peak_lr, kernel_lr_mult=50.0)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=peak_lr, weight_decay=0.01, eps=1e-8)
     warmup = max(total_steps // 10, 100)
     scheduler = WarmupCosineScheduler(optimizer, warmup, total_steps)
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+    # Training monitor (lightweight diagnostics)
+    monitor = None
+    if _monitor_available:
+        try:
+            safe_name = run_name.replace(' ', '_').replace('/', '-').lower()
+            monitor = WaveFieldMonitor(model, log_dir=f'results/monitor/{safe_name}')
+        except Exception:
+            pass
 
     best_val_loss = float('inf')
     best_ppl = float('inf')
@@ -396,7 +426,15 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
             tokens_seen += tokens_per_step
             step += 1
 
+            # Monitor: lightweight per-step logging
+            if monitor:
+                lr_now = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else peak_lr
+                monitor.step(step, loss.item(), lr=lr_now)
+
             if step % eval_interval == 0 or tokens_seen >= total_token_budget:
+                # Monitor: full snapshot (gradients still alive before next zero_grad)
+                if monitor:
+                    monitor.snapshot(step, sample_input=x[:2])
                 vl, vp, va = evaluate(model, val_data, batch_size, vocab_size, device, use_amp)
                 elapsed = time.time() - t0
                 tps = tokens_seen / elapsed
@@ -427,6 +465,13 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
 
     total_time = time.time() - t0
     final_tps = tokens_seen / total_time
+
+    # Save monitor report
+    if monitor:
+        try:
+            monitor.save_report()
+        except Exception as e:
+            print(f"    [Monitor] save_report failed: {e}")
 
     return {
         'run_name': run_name,

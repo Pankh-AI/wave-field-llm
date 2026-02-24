@@ -8,6 +8,68 @@ Wave Field LLM is a physics-based language model architecture that replaces O(n�
 
 **License:** AGPL-3.0 (derivatives must be open-sourced, network services must disclose source).
 
+## Repository Structure
+
+```
+src/                        # Core architecture (V4.3 SPECTRE-Wave)
+  wave_field_attention.py   #   Attention mechanism (kernels, feature maps, spectral gate)
+  wave_field_transformer.py #   Transformer layers, model, optimizer config
+  global_context.py         #   O(n) global context via causal cumulative mean
+  legacy/                   #   V1/V2 implementations (superseded)
+
+benchmarks/                 # Active benchmarks (run via Docker)
+  benchmark_scaling.py      #   S1-S4 scaling runs (primary)
+  benchmark_v43.py          #   V4.3 5M-token comparison
+  benchmark_v42.py          #   V4.2 ablation study
+  benchmark_v43_upgrade.py  #   V4.3 component ablation (S4D, Hedgehog, local window)
+  benchmark_v44_upgrade.py  #   V4.4 experiments (write gate, 3D interference)
+  benchmark_lr_sweep.py     #   Learning rate sweep
+  benchmark_long_context.py #   Long context speed/memory benchmark
+  benchmark_kernel_mixture.py # Kernel mixture experiments
+  legacy/                   #   Old/one-off benchmarks
+
+diagnostics/                # Training observability
+  training_monitor.py       #   WaveFieldMonitor — hooks into all internals
+  visualize_monitor.py      #   12-panel dashboard from monitor JSON
+  diagnose_physics.py       #   Energy flow / field state diagnostics
+  diagnose_bpe.py           #   Tokenizer diagnostics
+
+scripts/                    # Visualization and utilities
+  visualize_all_benchmarks.py # Master dashboard from all result JSONs
+  plot_long_context.py      #   Long context plots
+  visualize_v432.py         #   V4.3.2 analysis plots
+  visualize_v432_scaling.py #   V4.3.2 scaling analysis
+  vram_calc.py              #   VRAM estimation calculator
+  data_loader.py            #   Data loading utilities
+  pretokenize.py            #   Pre-tokenization script
+
+tests/                      # Standalone test scripts
+  test_causality.py         #   FFT causality verification (primary)
+  causality_probe.py        #   Detailed causality probing
+  causality_ablation.py     #   Causality ablation study
+  future_shuffle_eval.py    #   Future token shuffle evaluation
+
+docs/                       # Documentation
+  ARCHITECTURE.md           #   Full architecture doc
+  ARCHITECTURE_V43.md       #   V4.3 specifics
+  RESEARCH_V4.md            #   V4 research notes
+  WHAT_WORKS.md             #   What worked / what didn't
+  BENCHMARK_RESULTS.md      #   Historical benchmark results
+  research_gpt.md           #   GPT analysis of architecture gaps
+  indiaai/                  #   IndiaAI compute portal application docs
+  papers/                   #   Reference papers (PDFs)
+  plans/                    #   Design plans
+
+results/                    # Generated output (gitignored, Docker volume mount)
+  *.json                    #   Benchmark data
+  *.png                     #   Plots and dashboards
+  checkpoints/              #   Model checkpoints (.pt files)
+  monitor/                  #   Training monitor output
+  monitor_test/             #   Monitor test runs
+
+tokenizers/                 # Custom tokenizer implementations
+```
+
 ## Commands
 
 ```bash
@@ -18,12 +80,16 @@ pip install -r requirements.txt
 # Build once:
 docker compose build
 
-# Run latest benchmark (V4.3 by default):
-docker compose run --rm benchmark
+# Run scaling benchmark (S1 by default):
+docker compose run --rm s1
 
-# Run a specific benchmark:
-docker compose run --rm benchmark python benchmarks/benchmark_v43.py
-docker compose run --rm benchmark python benchmarks/benchmark_v42.py
+# Run specific benchmark:
+docker compose run --rm v43 python benchmarks/benchmark_v43.py
+
+# Run training monitor on GPU:
+docker compose run --rm v43 python diagnostics/training_monitor.py
+
+# Available Docker services: s1, s2, s3, v43
 
 # Results auto-saved to ./results/ via volume mount
 
@@ -38,6 +104,9 @@ python src/global_context.py
 # Physics diagnostics
 python diagnostics/diagnose_physics.py
 python diagnostics/diagnose_bpe.py
+
+# Generate visualization dashboards
+python scripts/visualize_all_benchmarks.py
 ```
 
 No pytest, no linter, no CI/CD configured. Tests are run as standalone scripts.
@@ -68,7 +137,7 @@ Causality is enforced by zeroing the kernel for t < 0 before FFT.
 ### Supporting Modules
 
 - `src/global_context.py` — O(n) global context via causal cumulative mean pooling. Extends receptive field beyond wave kernel locality (~18 positions).
-- `src/causal_field_attention.py`, `src/causal_field_transformer.py` — V1/V2 historical implementations, superseded by V3.5.
+- `src/legacy/` — V1/V2 historical implementations (causal_field_attention, causal_field_transformer), superseded by V3.5.
 
 ### Tokenizers (`tokenizers/`)
 
@@ -100,4 +169,5 @@ Benchmarks use HuggingFace `tokenizers` library for byte-level BPE (8K vocab).
 Bugs in this codebase are diagnosed through physics quantities, not profilers:
 - Suspiciously low training PPL → check for future token leakage via `tests/test_causality.py`
 - Collapsed outputs → inspect energy flow with `diagnostics/diagnose_physics.py`
+- Training dynamics → run `diagnostics/training_monitor.py` for kernel/FM/gate/gradient snapshots
 - The version history (V3.0→V3.5) documents each physics-diagnosed bug fix

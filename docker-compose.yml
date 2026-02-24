@@ -12,8 +12,10 @@ services:
               capabilities: [gpu]
     volumes:
       - ./results:/app/results
+      - data-cache:/app/.cache
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
       - BENCHMARK=benchmarks/benchmark_scaling.py
       - SCALE=S1
       - DATASET=2
@@ -31,8 +33,10 @@ services:
               capabilities: [gpu]
     volumes:
       - ./results:/app/results
+      - data-cache:/app/.cache
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
       - BENCHMARK=benchmarks/benchmark_scaling.py
       - SCALE=S2
       - DATASET=2
@@ -50,8 +54,10 @@ services:
               capabilities: [gpu]
     volumes:
       - ./results:/app/results
+      - data-cache:/app/.cache
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
       - BENCHMARK=benchmarks/benchmark_scaling.py
       - SCALE=S3
       - DATASET=103
@@ -69,6 +75,11 @@ services:
               capabilities: [gpu]
     volumes:
       - ./results:/app/results
+      - data-cache:/app/.cache
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
       - BENCHMARK=benchmarks/benchmark_v43.py
+
+volumes:
+  data-cache:
