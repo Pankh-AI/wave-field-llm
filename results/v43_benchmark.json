@@ -1,0 +1,24 @@
+[
+  {
+    "run_name": "B) V4.3 SPECTRE (full)",
+    "params": 8577938,
+    "seq_len": 512,
+    "best_ppl": 117.59,
+    "best_acc": 28.7,
+    "tokens_seen": 5005312,
+    "total_time_s": 150.6,
+    "tokens_per_sec": 33232,
+    "epochs": 2
+  },
+  {
+    "run_name": "C) Standard Transformer",
+    "params": 6918656,
+    "seq_len": 512,
+    "best_ppl": 457.16,
+    "best_acc": 11.79,
+    "tokens_seen": 5005312,
+    "total_time_s": 50.4,
+    "tokens_per_sec": 99337,
+    "epochs": 2
+  }
+]

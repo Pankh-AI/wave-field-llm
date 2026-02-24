@@ -6,12 +6,16 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/*
 
-# Python deps
+# Python deps (cached layer — only rebuilds when requirements.txt changes)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt matplotlib
 
-# Copy project
+# Copy project (see .dockerignore for exclusions)
 COPY . .
 
-# Default: run the long-context benchmark
-CMD ["python", "benchmarks/benchmark_long_context.py"]
+# Results directory (volume mount target)
+RUN mkdir -p /app/results
+
+# Default benchmark — override with BENCHMARK env var or docker compose command
+ENV BENCHMARK=benchmarks/benchmark_v43.py
+CMD python ${BENCHMARK}

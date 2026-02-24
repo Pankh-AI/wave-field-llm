@@ -12,4 +12,5 @@ services:
       - ./results:/app/results
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-    command: python benchmarks/benchmark_long_context.py
+      - BENCHMARK=${BENCHMARK:-benchmarks/benchmark_v43.py}
+    # Override per run: docker compose run benchmark python benchmarks/benchmark_v42.py

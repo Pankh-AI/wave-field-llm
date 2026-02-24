@@ -276,6 +276,30 @@ class WaveFieldTransformer(nn.Module):
                     torch.nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+        # V4.3: Re-apply attention-specific initialization that the generic
+        # init above overwrites.
+        from .wave_field_attention import LearnedFeatureMap
+        for layer in self.layers:
+            attn = layer.attention
+            D = self.embedding_dim
+
+            with torch.no_grad():
+                # Gate rows (last D) — bias=2.0, weight=0 (gates start open)
+                attn.qkvg_proj.weight[3 * D:].zero_()
+                attn.qkvg_proj.bias[3 * D:].fill_(2.0)
+
+                # Learned feature maps: restore identity init (generic init
+                # overwrites with normal(0, 0.02), destroying the identity)
+                nn.init.eye_(attn.q_feature_map.linear.weight)
+                nn.init.zeros_(attn.q_feature_map.linear.bias)
+                nn.init.eye_(attn.k_feature_map.linear.weight)
+                nn.init.zeros_(attn.k_feature_map.linear.bias)
+
+                # Spectral gate: restore near-zero output init (generic init
+                # sets std=0.02, we need ~0.001 so gate starts at ≈0)
+                nn.init.normal_(attn.spectral_gate.net[-1].weight, 0, 0.001)
+                nn.init.zeros_(attn.spectral_gate.net[-1].bias)
     
     def forward(self, input_ids, labels=None, mask=None):
         """

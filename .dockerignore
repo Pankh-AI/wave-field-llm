@@ -1,0 +1,35 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+
+# Research papers (large PDFs, not needed for benchmarks)
+docs/papers/
+
+# Results (mounted as volume, not baked into image)
+results/
+
+# Docker files (no need to copy themselves)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/

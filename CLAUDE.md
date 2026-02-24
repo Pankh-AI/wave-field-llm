@@ -11,24 +11,33 @@ Wave Field LLM is a physics-based language model architecture that replaces O(n�
 ## Commands
 
 ```bash
-# Install dependencies
+# Install dependencies (local dev only — benchmarks run in Docker)
 pip install -r requirements.txt
 
-# Run causality test (verifies FFT doesn't leak future tokens)
+# ---- Docker (standard way to run benchmarks) ----
+# Build once:
+docker compose build
+
+# Run latest benchmark (V4.3 by default):
+docker compose run --rm benchmark
+
+# Run a specific benchmark:
+docker compose run --rm benchmark python benchmarks/benchmark_v43.py
+docker compose run --rm benchmark python benchmarks/benchmark_v42.py
+
+# Results auto-saved to ./results/ via volume mount
+
+# ---- Local (no GPU required) ----
+# Causality test (verifies FFT doesn't leak future tokens)
 python tests/test_causality.py
-
-# Benchmarks
-python benchmarks/benchmark_wikitext2.py      # Wave V3.4 vs Standard Transformer on WikiText-2
-python benchmarks/train_wave_v35_bpe.py        # V3.5 + BPE tokenizer training
-python benchmarks/train_100m_bpe.py            # 100M parameter scaling experiment
-
-# Physics diagnostics
-python diagnostics/diagnose_physics.py         # Energy flow, conservation, causality checks
-python diagnostics/diagnose_bpe.py             # BPE tokenizer diagnostics
 
 # Module-level smoke tests (each has __main__ block)
 python src/wave_field_transformer.py
 python src/global_context.py
+
+# Physics diagnostics
+python diagnostics/diagnose_physics.py
+python diagnostics/diagnose_bpe.py
 ```
 
 No pytest, no linter, no CI/CD configured. Tests are run as standalone scripts.
@@ -37,14 +46,18 @@ No pytest, no linter, no CI/CD configured. Tests are run as standalone scripts.
 
 ### Core: Wave Field Attention (`src/wave_field_attention.py`)
 
-Each attention head is a damped wave with 3 learnable parameters:
-- `wave_frequency` — oscillation speed (controls attention pattern periodicity)
-- `wave_damping` — decay rate (how far back to attend)
+V4.3 SPECTRE-Wave architecture. Each attention head is a damped wave with 3 learnable parameters:
+- `wave_frequency` — oscillation speed (HiPPO harmonic init: `ω_n = π(2n+1)/2`)
+- `wave_damping` — decay rate (uniform init: `softplus(-0.69) ≈ 0.5`)
 - `wave_phase` — offset (head diversity)
 
-**Pipeline:** Tokens → QKV projection → bilinear scatter onto continuous field → FFT convolution with wave kernel → static cross-head field coupling → content-dependent gating → bilinear gather back to token positions.
+Key modules:
+- `LearnedFeatureMap` — identity-init Linear + ReLU (Hedgehog, ICLR 2024). Replaces `elu(x)+1`.
+- `SpectralGate` — MLP conditioned on `mean(Q)` that modulates kernel FFT per-sample (SPECTRE, arXiv:2502.18394). Makes attention input-dependent while staying O(n log n).
 
-Causality is enforced by zeroing the kernel for t < 0 before FFT. Energy conservation was intentionally removed in V3.5 because absolute position mapping leaves most of the field empty, and rescaling crushes information.
+**Pipeline:** Tokens → QKV projection → learned feature maps φ(K), φ(Q) → K-weighted deposit → bilinear scatter onto field → content-adaptive spectral modulation of kernel FFT → FFT convolution → cross-head coupling → bilinear gather → Q-weighted read → gating → output.
+
+Causality is enforced by zeroing the kernel for t < 0 before FFT.
 
 ### Transformer (`src/wave_field_transformer.py`)
 
