@@ -23,6 +23,7 @@ Complexity: O(n log n) per layer — between O(n) and O(n²)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 import math
 import sys
 import os
@@ -68,14 +69,17 @@ class WaveFieldTransformerLayer(nn.Module):
     """
     
     def __init__(self, embedding_dim=256, num_heads=8, ffn_dim=1024,
-                 field_size=512, max_seq_len=128, dropout=0.1, device='cuda'):
+                 field_size=512, max_seq_len=128, dropout=0.1,
+                 n_components=1, local_window=0, device='cuda'):
         super().__init__()
-        
+
         self.attention = WaveFieldAttention(
             embedding_dim=embedding_dim,
             num_heads=num_heads,
             field_size=field_size,
             max_seq_len=max_seq_len,
+            n_components=n_components,
+            local_window=local_window,
             device=device
         )
         
@@ -205,6 +209,8 @@ class WaveFieldTransformer(nn.Module):
                  dropout=0.1,
                  use_checkpoint=False,
                  interference_interval=3,
+                 n_components=1,
+                 local_window=0,
                  device=None):
         super().__init__()
         
@@ -233,6 +239,8 @@ class WaveFieldTransformer(nn.Module):
                 field_size=field_size,
                 max_seq_len=max_seq_len,
                 dropout=dropout,
+                n_components=n_components,
+                local_window=local_window,
                 device=self.device
             )
             for _ in range(num_layers)

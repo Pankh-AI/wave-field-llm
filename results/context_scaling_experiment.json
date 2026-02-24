@@ -1,0 +1,107 @@
+[
+  {
+    "run_name": "Standard @ 256",
+    "params": 6853120,
+    "seq_len": 256,
+    "best_ppl": 458.08,
+    "best_acc": 11.85,
+    "tokens_seen": 5005312,
+    "total_time_s": 37.8,
+    "tokens_per_sec": 132358,
+    "epochs": 2
+  },
+  {
+    "run_name": "Standard @ 512",
+    "params": 6918656,
+    "seq_len": 512,
+    "best_ppl": 465.13,
+    "best_acc": 11.82,
+    "tokens_seen": 5005312,
+    "total_time_s": 42.4,
+    "tokens_per_sec": 118121,
+    "epochs": 2
+  },
+  {
+    "run_name": "Standard @ 1024",
+    "params": 7049728,
+    "seq_len": 1024,
+    "best_ppl": 470.5,
+    "best_acc": 11.69,
+    "tokens_seen": 5005312,
+    "total_time_s": 44.9,
+    "tokens_per_sec": 111365,
+    "epochs": 2
+  },
+  {
+    "run_name": "Wave @ 256",
+    "params": 7775378,
+    "seq_len": 256,
+    "best_ppl": 1251.38,
+    "best_acc": 6.09,
+    "tokens_seen": 5005312,
+    "total_time_s": 135.3,
+    "tokens_per_sec": 36985,
+    "epochs": 2,
+    "field_size": 1024
+  },
+  {
+    "run_name": "Wave @ 512",
+    "params": 7775378,
+    "seq_len": 512,
+    "best_ppl": 1336.32,
+    "best_acc": 5.16,
+    "tokens_seen": 5005312,
+    "total_time_s": 101.6,
+    "tokens_per_sec": 49262,
+    "epochs": 2,
+    "field_size": 1024
+  },
+  {
+    "run_name": "Wave @ 1024",
+    "params": 7775378,
+    "seq_len": 1024,
+    "best_ppl": 1353.43,
+    "best_acc": 4.55,
+    "tokens_seen": 5005312,
+    "total_time_s": 90.9,
+    "tokens_per_sec": 55066,
+    "epochs": 2,
+    "field_size": 1024
+  },
+  {
+    "run_name": "Wave @ 2048 (f=1024 compressed)",
+    "params": 7775378,
+    "seq_len": 2048,
+    "best_ppl": 1353.7,
+    "best_acc": 4.55,
+    "tokens_seen": 5005312,
+    "total_time_s": 79.8,
+    "tokens_per_sec": 62724,
+    "epochs": 2,
+    "field_size": 1024
+  },
+  {
+    "run_name": "Wave @ 2048 (f=2048 scaled)",
+    "params": 7775378,
+    "seq_len": 2048,
+    "best_ppl": 1357.59,
+    "best_acc": 4.55,
+    "tokens_seen": 5005312,
+    "total_time_s": 89.5,
+    "tokens_per_sec": 55951,
+    "epochs": 2,
+    "field_size": 2048
+  },
+  {
+    "run_name": "Wave @ 4096 (f=4096 scaled)",
+    "params": 7775378,
+    "seq_len": 4096,
+    "best_ppl": 1354.08,
+    "best_acc": 4.59,
+    "tokens_seen": 5005312,
+    "total_time_s": 92.4,
+    "tokens_per_sec": 54178,
+    "epochs": 2,
+    "field_size": 4096
+  }
+]

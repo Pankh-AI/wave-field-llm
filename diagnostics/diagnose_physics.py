@@ -90,43 +90,75 @@ def main():
 
     for layer_idx, layer in enumerate(model.layers):
         attn = layer.attention
-        omega = attn.wave_frequency.detach().cpu()
-        alpha_raw = attn.wave_damping.detach().cpu()
-        alpha = F.softplus(alpha_raw)
-        phi = attn.wave_phase.detach().cpu()
+        C = attn.n_components
+        H = attn.num_heads
 
-        print(f"\n  Layer {layer_idx + 1}:")
-        print(f"  {'Head':<6} {'Freq(w)':>8} {'Damp(a)':>8} {'Phase(p)':>8} {'Range':>8}  Role")
-        print(f"  {'-'*6} {'-'*8} {'-'*8} {'-'*8} {'-'*8}  {'-'*25}")
+        if C == 1:
+            # Single component: original display (params are (H,))
+            omega = attn.wave_frequency.detach().cpu()
+            alpha = F.softplus(attn.wave_damping.detach().cpu())
+            phi = attn.wave_phase.detach().cpu()
 
-        for h in range(8):
-            w = omega[h].item()
-            a = alpha[h].item()
-            p = phi[h].item()
+            print(f"\n  Layer {layer_idx + 1}:")
+            print(f"  {'Head':<6} {'Freq(w)':>8} {'Damp(a)':>8} {'Phase(p)':>8} {'Range':>8}  Role")
+            print(f"  {'-'*6} {'-'*8} {'-'*8} {'-'*8} {'-'*8}  {'-'*25}")
 
-            # Effective range: how far before signal decays to 10%
-            if a > 0.01:
-                eff_range = min(int(-math.log(0.1) / a), field_size)
+            for h in range(H):
+                w = omega[h].item()
+                a = alpha[h].item()
+                p = phi[h].item()
+
+                if a > 0.01:
+                    eff_range = min(int(-math.log(0.1) / a), field_size)
+                else:
+                    eff_range = field_size
+
+                if a > 0.5 and abs(w) < 1.5:
+                    role = "LOCAL (grammar/syntax)"
+                elif a < 0.3 and abs(w) > 2.0:
+                    role = "GLOBAL (long patterns)"
+                elif a < 0.3 and abs(w) < 1.5:
+                    role = "WIDE SMOOTH (context)"
+                elif abs(w) > 3.0:
+                    role = "HIGH-FREQ (periodicity)"
+                else:
+                    role = "MEDIUM (balanced)"
+
+                bar_len = min(eff_range // 20, 30)
+                bar = "\u2588" * bar_len + "\u2591" * max(0, 30 - bar_len)
+
+                print(f"  H{h+1:<4} {w:>8.3f} {a:>8.3f} {p:>8.3f} {eff_range:>7}  {role}")
+                print(f"         {bar}")
+        else:
+            # Multi-component: show each component per head
+            omega = attn.wave_frequency.detach().cpu()        # (H, C)
+            alpha = F.softplus(attn.wave_damping.detach().cpu())
+            phi = attn.wave_phase.detach().cpu()
+            if attn.component_weights is not None:
+                cw = F.softmax(attn.component_weights.detach().cpu(), dim=-1)
             else:
-                eff_range = field_size
+                cw = torch.ones(H, C) / C
 
-            # Classify role
-            if a > 0.5 and abs(w) < 1.5:
-                role = "LOCAL (grammar/syntax)"
-            elif a < 0.3 and abs(w) > 2.0:
-                role = "GLOBAL (long patterns)"
-            elif a < 0.3 and abs(w) < 1.5:
-                role = "WIDE SMOOTH (context)"
-            elif abs(w) > 3.0:
-                role = "HIGH-FREQ (periodicity)"
-            else:
-                role = "MEDIUM (balanced)"
+            print(f"\n  Layer {layer_idx + 1} ({C} components per head):")
+            for h in range(H):
+                print(f"  H{h+1}:")
+                for c in range(C):
+                    w_hc = omega[h, c].item()
+                    a_hc = alpha[h, c].item()
+                    wt = cw[h, c].item()
+                    if a_hc > 0.01:
+                        eff_range = min(int(-math.log(0.1) / a_hc), field_size)
+                    else:
+                        eff_range = field_size
+                    print(f"    C{c} w={wt:.2f} freq={w_hc:.3f} damp={a_hc:.3f} range={eff_range}")
 
-            bar_len = min(eff_range // 20, 30)
-            bar = "█" * bar_len + "░" * max(0, 30 - bar_len)
-
-            print(f"  H{h+1:<4} {w:>8.3f} {a:>8.3f} {p:>8.3f} {eff_range:>7}  {role}")
-            print(f"         {bar}")
+        # Show local blend if present
+        if attn.local_blend is not None:
+            blend_vals = torch.sigmoid(attn.local_blend.detach().cpu())
+            print(f"\n  Local attention blend (per head):")
+            for h in range(H):
+                b = blend_vals[h].item()
+                print(f"    H{h+1}: wave={1-b:.0%} local={b:.0%}")
 
     # ============================================================
     # 2. STATIC FIELD COUPLING (V3.4, same as V3.2)
@@ -209,7 +241,7 @@ def main():
                 energies_per_layer.append(energy.detach().cpu())
 
                 # Measure gate activation
-                gate = torch.sigmoid(module.gate_proj(x))
+                gate = torch.sigmoid(module.qkvg_proj(x).chunk(4, dim=-1)[3])
                 gate_mean = gate.mean(dim=-1).squeeze(0)  # (N,)
                 gate_values_per_layer.append(gate_mean.detach().cpu())
 

@@ -1,0 +1,110 @@
+{
+  "config": {
+    "vocab_size": 256,
+    "embedding_dim": 256,
+    "num_layers": 6,
+    "num_heads": 8,
+    "ffn_dim": 1024,
+    "field_size": 1024
+  },
+  "standard": {
+    "256": {
+      "fwd_ms": 3.49,
+      "fwd_min_ms": 3.16,
+      "fwd_bwd_ms": 20.27,
+      "peak_mem_mb": 73.0,
+      "tokens_per_sec": 73257,
+      "loss": 5.5929
+    },
+    "512": {
+      "fwd_ms": 4.98,
+      "fwd_min_ms": 3.54,
+      "fwd_bwd_ms": 18.81,
+      "peak_mem_mb": 101.4,
+      "tokens_per_sec": 102813,
+      "loss": 5.5914
+    },
+    "1024": {
+      "fwd_ms": 10.05,
+      "fwd_min_ms": 9.35,
+      "fwd_bwd_ms": 20.82,
+      "peak_mem_mb": 156.3,
+      "tokens_per_sec": 101873,
+      "loss": 5.6085
+    },
+    "2048": {
+      "fwd_ms": 41.03,
+      "fwd_min_ms": 40.21,
+      "fwd_bwd_ms": 44.77,
+      "peak_mem_mb": 273.9,
+      "tokens_per_sec": 49916,
+      "loss": 5.6044
+    },
+    "4096": {
+      "fwd_ms": 132.45,
+      "fwd_min_ms": 131.49,
+      "fwd_bwd_ms": 131.81,
+      "peak_mem_mb": 536.7,
+      "tokens_per_sec": 30924,
+      "loss": 5.6019
+    },
+    "8192": {
+      "fwd_ms": 5921.96,
+      "fwd_min_ms": 5893.85,
+      "fwd_bwd_ms": 2148.95,
+      "peak_mem_mb": 1163.0,
+      "tokens_per_sec": 1383,
+      "loss": 5.6027
+    }
+  },
+  "wave": {
+    "256": {
+      "fwd_ms": 15.31,
+      "fwd_min_ms": 14.43,
+      "fwd_bwd_ms": 48.83,
+      "peak_mem_mb": 126.9,
+      "tokens_per_sec": 16720,
+      "loss": 5.5934
+    },
+    "512": {
+      "fwd_ms": 17.22,
+      "fwd_min_ms": 13.53,
+      "fwd_bwd_ms": 41.8,
+      "peak_mem_mb": 161.7,
+      "tokens_per_sec": 29727,
+      "loss": 5.5974
+    },
+    "1024": {
+      "fwd_ms": 14.58,
+      "fwd_min_ms": 13.76,
+      "fwd_bwd_ms": 40.88,
+      "peak_mem_mb": 236.5,
+      "tokens_per_sec": 70221,
+      "loss": 5.6048
+    },
+    "2048": {
+      "fwd_ms": 20.22,
+      "fwd_min_ms": 18.28,
+      "fwd_bwd_ms": 58.76,
+      "peak_mem_mb": 372.2,
+      "tokens_per_sec": 101269,
+      "loss": 5.6003
+    },
+    "4096": {
+      "fwd_ms": 30.03,
+      "fwd_min_ms": 28.61,
+      "fwd_bwd_ms": 82.06,
+      "peak_mem_mb": 655.6,
+      "tokens_per_sec": 136408,
+      "loss": 5.5989
+    },
+    "8192": {
+      "fwd_ms": 54.02,
+      "fwd_min_ms": 52.41,
+      "fwd_bwd_ms": 131.71,
+      "peak_mem_mb": 1222.4,
+      "tokens_per_sec": 151643,
+      "loss": 5.5984
+    }
+  }
+}

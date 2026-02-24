@@ -249,7 +249,7 @@ def main():
                 if x.dim() == 2: x = x.unsqueeze(0)
                 B, N, D = x.shape
                 energies.append(x.norm(dim=-1).squeeze(0).detach().cpu())
-                gate = torch.sigmoid(module.gate_proj(x))
+                gate = torch.sigmoid(module.qkvg_proj(x).chunk(4, dim=-1)[3])
                 gate_vals.append(gate.mean(dim=-1).squeeze(0).detach().cpu())
             return hook
 
