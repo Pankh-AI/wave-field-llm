@@ -70,7 +70,8 @@ class WaveFieldTransformerLayer(nn.Module):
     
     def __init__(self, embedding_dim=256, num_heads=8, ffn_dim=1024,
                  field_size=512, max_seq_len=128, dropout=0.1,
-                 n_components=1, local_window=0, device='cuda'):
+                 n_components=1, local_window=0, use_analytic_kernel=True,
+                 feature_map_depth=2, device='cuda'):
         super().__init__()
 
         self.attention = WaveFieldAttention(
@@ -80,6 +81,8 @@ class WaveFieldTransformerLayer(nn.Module):
             max_seq_len=max_seq_len,
             n_components=n_components,
             local_window=local_window,
+            use_analytic_kernel=use_analytic_kernel,
+            feature_map_depth=feature_map_depth,
             device=device
         )
         
@@ -211,14 +214,19 @@ class WaveFieldTransformer(nn.Module):
                  interference_interval=3,
                  n_components=1,
                  local_window=0,
-                 device=None):
+                 device=None,
+                 use_analytic_kernel=True,
+                 feature_map_depth=2,
+                 residual_scale=False):
         super().__init__()
-        
+
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
+        self.num_heads = num_heads
         self.max_seq_len = max_seq_len
         self.use_checkpoint = use_checkpoint
         self.interference_interval = interference_interval
+        self.residual_scale = residual_scale
         self.device = device if device is not None else (
             'cuda' if torch.cuda.is_available() else 'cpu'
         )
@@ -241,6 +249,8 @@ class WaveFieldTransformer(nn.Module):
                 dropout=dropout,
                 n_components=n_components,
                 local_window=local_window,
+                use_analytic_kernel=use_analytic_kernel,
+                feature_map_depth=feature_map_depth,
                 device=self.device
             )
             for _ in range(num_layers)
@@ -277,30 +287,62 @@ class WaveFieldTransformer(nn.Module):
             elif isinstance(module, nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        # V4.3: Re-apply attention-specific initialization that the generic
+        # Re-apply attention-specific initialization that the generic
         # init above overwrites.
-        from .wave_field_attention import LearnedFeatureMap
+        H = self.num_heads
+        D = self.embedding_dim
+        head_dim = D // H
+
         for layer in self.layers:
             attn = layer.attention
-            D = self.embedding_dim
 
             with torch.no_grad():
                 # Gate rows (last D) — bias=2.0, weight=0 (gates start open)
                 attn.qkvg_proj.weight[3 * D:].zero_()
                 attn.qkvg_proj.bias[3 * D:].fill_(2.0)
 
-                # Learned feature maps: restore identity init (generic init
-                # overwrites with normal(0, 0.02), destroying the identity)
-                nn.init.eye_(attn.q_feature_map.linear.weight)
-                nn.init.zeros_(attn.q_feature_map.linear.bias)
-                nn.init.eye_(attn.k_feature_map.linear.weight)
-                nn.init.zeros_(attn.k_feature_map.linear.bias)
+                # Learned feature maps: restore identity init for all Linear layers
+                # (generic init above overwrites with normal_(0, 0.02))
+                for fm in [attn.q_feature_map, attn.k_feature_map]:
+                    for module in fm.net:
+                        if isinstance(module, nn.Linear):
+                            nn.init.eye_(module.weight)
+                            nn.init.zeros_(module.bias)
 
-                # Spectral gate: restore near-zero output init (generic init
-                # sets std=0.02, we need ~0.001 so gate starts at ≈0)
+                # Spectral gate: restore near-zero output init
                 nn.init.normal_(attn.spectral_gate.net[-1].weight, 0, 0.001)
                 nn.init.zeros_(attn.spectral_gate.net[-1].bias)
-    
+
+        # V4.2-D: Residual scaling — scale down residual contribution at init
+        # to stabilize deep networks (GPT-style 1/sqrt(2*num_layers)).
+        if self.residual_scale:
+            scale = (2 * len(self.layers)) ** -0.5
+            for layer in self.layers:
+                with torch.no_grad():
+                    layer.attention.out_proj.weight.mul_(scale)
+                    layer.ffn[3].weight.mul_(scale)  # second Linear in FFN
+
+    def configure_optimizer(self, base_lr, weight_decay=0.01, qk_lr_mult=3.0):
+        """Create AdamW optimizer with elevated LR for QKV projection parameters.
+
+        V4.2 ablation proved 3x LR on qkvg_proj gives -21% PPL improvement
+        by accelerating feature map escape from the uniform-routing plateau
+        (arXiv:2501.16265 plateau theory + GLA ICML 2024 separate param groups).
+        """
+        qk_params = []
+        other_params = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'qkvg_proj' in name:
+                qk_params.append(param)
+            else:
+                other_params.append(param)
+        return torch.optim.AdamW([
+            {'params': other_params, 'lr': base_lr},
+            {'params': qk_params, 'lr': base_lr * qk_lr_mult},
+        ], weight_decay=weight_decay)
+
     def forward(self, input_ids, labels=None, mask=None):
         """
         Forward pass.

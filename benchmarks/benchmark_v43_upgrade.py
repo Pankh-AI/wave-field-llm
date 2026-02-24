@@ -1,17 +1,16 @@
 """
-V4.2 Ablation Benchmark — Data Efficiency Improvements
-=======================================================
-Tests V4.2 changes that improve data efficiency while preserving causality.
+V4.3 Upgrade Benchmark -- Complex Kernel + Hedgehog FM + Local Window
+=====================================================================
+Tests three proven improvements incrementally:
 
-Configs (all at 5M tokens, WikiText-2):
-  A) Baseline (V4.1 causal-fixed, no V4.2 changes)
-  B) + Q/K bias diversity
-  C) + Elevated QK LR (3x)
-  D) + Residual scaling
-  E) Full V4.2 (B + C + D)
-  F) Standard Transformer reference
+  A) V4.3 Baseline  -- legacy rfft kernel, 1-layer FM, no local, QK LR 3x
+  B) + Analytic Kernel -- S4D-style Z-transform, automatic causality
+  C) + 2-Layer FM    -- Hedgehog ICLR 2024 (closes 68.6% of gap)
+  D) + Local Window  -- BASED hybrid (local+global = Pareto-optimal)
+  E) Standard Transformer reference
 
-Architecture matches S1: 384 dim, 8 layers, 8 heads, 1536 ffn, 2048 field.
+Architecture: S1 config (384 dim, 8 layers, 8 heads, 22M params).
+All Wave configs use elevated QK LR (3x) -- proven in V4.2 ablation.
 """
 
 import torch
@@ -26,6 +25,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.wave_field_transformer import WaveFieldTransformer
+
 
 # ======================================================================
 # STANDARD TRANSFORMER (baseline)
@@ -205,18 +205,21 @@ ARCH = {
     'token_budget': 5_000_000, 'peak_lr': 3e-4,
 }
 
+# All Wave configs use elevated QK LR (3x) -- proven in V4.2 ablation.
 CONFIGS = [
-    {'key': 'A', 'name': 'A) Baseline (causal-fixed)',
-     'type': 'wave', 'qk_bias_diversity': False, 'qk_lr_mult': 1.0, 'residual_scale': False},
-    {'key': 'B', 'name': 'B) + Q/K bias diversity',
-     'type': 'wave', 'qk_bias_diversity': True,  'qk_lr_mult': 1.0, 'residual_scale': False},
-    {'key': 'C', 'name': 'C) + Elevated QK LR (3x)',
-     'type': 'wave', 'qk_bias_diversity': False, 'qk_lr_mult': 3.0, 'residual_scale': False},
-    {'key': 'D', 'name': 'D) + Residual scaling',
-     'type': 'wave', 'qk_bias_diversity': False, 'qk_lr_mult': 1.0, 'residual_scale': True},
-    {'key': 'E', 'name': 'E) Full V4.2 (B+C+D)',
-     'type': 'wave', 'qk_bias_diversity': True,  'qk_lr_mult': 3.0, 'residual_scale': True},
-    {'key': 'F', 'name': 'F) Standard Transformer',
+    {'key': 'A', 'name': 'A) Baseline (legacy kernel, 1L FM)',
+     'type': 'wave', 'use_analytic_kernel': False, 'feature_map_depth': 1,
+     'local_window': 0},
+    {'key': 'B', 'name': 'B) + Analytic kernel (S4D Z-transform)',
+     'type': 'wave', 'use_analytic_kernel': True, 'feature_map_depth': 1,
+     'local_window': 0},
+    {'key': 'C', 'name': 'C) + 2-Layer FM (Hedgehog)',
+     'type': 'wave', 'use_analytic_kernel': True, 'feature_map_depth': 2,
+     'local_window': 0},
+    {'key': 'D', 'name': 'D) + Local window 64 (BASED)',
+     'type': 'wave', 'use_analytic_kernel': True, 'feature_map_depth': 2,
+     'local_window': 64},
+    {'key': 'E', 'name': 'E) Standard Transformer',
      'type': 'standard'},
 ]
 
@@ -225,33 +228,24 @@ CONFIGS = [
 # TRAIN RUN
 # ======================================================================
 
-def train_run(model, train_data, val_data, vocab_size, device, run_name,
-              peak_lr, qk_lr_mult, use_amp):
+def train_run(model, train_data, val_data, vocab_size, device, run_name, use_amp):
     seq_len = ARCH['seq_len']
     batch_size = ARCH['batch_size']
     token_budget = ARCH['token_budget']
     tokens_per_step = batch_size * seq_len
     total_steps = token_budget // tokens_per_step
     params = sum(p.numel() for p in model.parameters())
+    peak_lr = ARCH['peak_lr']
 
     print(f"\n  --- {run_name} ---")
     print(f"  Params: {params:,} | Steps: {total_steps:,}", flush=True)
 
-    # Optimizer with optional QK param group
-    if qk_lr_mult != 1.0 and hasattr(model, 'layers'):
-        qk_ids = set()
-        qk_params = []
-        for layer in model.layers:
-            attn = layer.attention
-            qk_params.extend([attn.qkvg_proj.weight, attn.qkvg_proj.bias])
-            qk_ids.update([id(attn.qkvg_proj.weight), id(attn.qkvg_proj.bias)])
-        other_params = [p for p in model.parameters() if id(p) not in qk_ids]
-        optimizer = torch.optim.AdamW([
-            {'params': other_params, 'lr': peak_lr},
-            {'params': qk_params, 'lr': peak_lr * qk_lr_mult},
-        ], weight_decay=0.01, eps=1e-8)
+    # Use configure_optimizer for Wave models (includes elevated QK LR 3x)
+    if hasattr(model, 'configure_optimizer'):
+        optimizer = model.configure_optimizer(base_lr=peak_lr, qk_lr_mult=3.0)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=peak_lr, weight_decay=0.01, eps=1e-8)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=peak_lr,
+                                      weight_decay=0.01, eps=1e-8)
 
     warmup = max(total_steps // 10, 50)
     scheduler = WarmupCosineScheduler(optimizer, warmup, total_steps)
@@ -328,8 +322,9 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
 
 def main():
     print("=" * 65)
-    print("  V4.2 ABLATION BENCHMARK")
-    print("  Data efficiency improvements (5M tokens, WikiText-2)")
+    print("  V4.3 UPGRADE BENCHMARK")
+    print("  Analytic kernel + Hedgehog FM + Local window")
+    print("  All Wave configs use QK LR 3x (proven V4.2)")
     print("=" * 65)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -351,7 +346,7 @@ def main():
     train_data = make_chunks(train_ids, ARCH['seq_len'])
     val_data = make_chunks(val_ids, ARCH['seq_len'])
 
-    # Filter configs
+    # Filter configs via env var
     config_filter = os.environ.get('CONFIGS', '').strip().upper()
     if config_filter:
         keys = [k.strip() for k in config_filter.split(',')]
@@ -375,7 +370,6 @@ def main():
                 max_seq_len=ARCH['seq_len'] + 2,
                 dropout=0.1,
             ).to(device)
-            qk_lr_mult = 1.0
         else:
             model = WaveFieldTransformer(
                 vocab_size=vocab_size,
@@ -389,17 +383,16 @@ def main():
                 use_checkpoint=True,
                 interference_interval=3,
                 n_components=1,
-                local_window=0,
+                local_window=cfg.get('local_window', 0),
                 device=device,
-                qk_bias_diversity=cfg.get('qk_bias_diversity', False),
-                residual_scale=cfg.get('residual_scale', False),
+                use_analytic_kernel=cfg.get('use_analytic_kernel', True),
+                feature_map_depth=cfg.get('feature_map_depth', 2),
             ).to(device)
-            qk_lr_mult = cfg.get('qk_lr_mult', 1.0)
 
         try:
             result = train_run(
                 model, train_data, val_data, vocab_size, device,
-                cfg['name'], ARCH['peak_lr'], qk_lr_mult, use_amp,
+                cfg['name'], use_amp,
             )
             all_results.append(result)
         except RuntimeError as e:
@@ -416,14 +409,14 @@ def main():
     # Save JSON
     results_dir = os.path.join(os.path.dirname(__file__), '..', 'results')
     os.makedirs(results_dir, exist_ok=True)
-    with open(os.path.join(results_dir, 'v42_ablation.json'), 'w') as f:
+    with open(os.path.join(results_dir, 'v43_upgrade.json'), 'w') as f:
         json.dump(all_results, f, indent=2)
 
     # Print summary
     print(f"\n{'=' * 65}")
-    print(f"  V4.2 ABLATION RESULTS (5M tokens, WikiText-2)")
-    print(f"  {'Config':<40} {'PPL':>8} {'Acc':>8} {'Time':>8}")
-    print(f"  {'-'*40} {'-'*8} {'-'*8} {'-'*8}")
+    print(f"  V4.3 UPGRADE RESULTS (5M tokens, WikiText-2)")
+    print(f"  {'Config':<45} {'PPL':>8} {'Acc':>8} {'Time':>8}")
+    print(f"  {'-'*45} {'-'*8} {'-'*8} {'-'*8}")
     for r in all_results:
         ppl = r.get('best_ppl', '-')
         acc = r.get('best_acc', '-')
@@ -431,7 +424,7 @@ def main():
         ppl_s = f"{ppl:>8.1f}" if isinstance(ppl, (int, float)) else f"{ppl:>8}"
         acc_s = f"{acc:>7.1f}%" if isinstance(acc, (int, float)) else f"{acc:>8}"
         t_s = f"{t:>7.0f}s" if isinstance(t, (int, float)) else f"{t:>8}"
-        print(f"  {r['run_name']:<40} {ppl_s} {acc_s} {t_s}")
+        print(f"  {r['run_name']:<45} {ppl_s} {acc_s} {t_s}")
     print(f"{'=' * 65}")
 
 

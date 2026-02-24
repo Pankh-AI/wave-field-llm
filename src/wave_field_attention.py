@@ -47,22 +47,29 @@ import math
 class LearnedFeatureMap(nn.Module):
     """Learned positive feature map for linear attention (Hedgehog, ICLR 2024).
 
-    A single Linear(d, d) initialized as identity, followed by ReLU + epsilon.
-    At init: φ(x) ≈ ReLU(x) + eps — every token is distinct from step 1.
+    MLP of `depth` identity-initialized Linear(d,d) + ReLU layers.
+    At init: phi(x) = ReLU(ReLU(...(Ix))) = ReLU(x) + eps — tokens distinct from step 1.
     During training: learns spiky, dot-product-monotonic maps that mimic softmax.
+
+    depth=1: original V4.3 (single linear).
+    depth=2: Hedgehog-style (closes 68.6% of linear-vs-softmax gap at 125M scale).
     """
 
-    def __init__(self, dim, eps=1e-6):
+    def __init__(self, dim, eps=1e-6, depth=2):
         super().__init__()
-        self.linear = nn.Linear(dim, dim, bias=True)
         self.eps = eps
-        # Identity init — at init, φ(x) = ReLU(Ix + 0) + eps ≈ ReLU(x)
-        with torch.no_grad():
-            nn.init.eye_(self.linear.weight)
-            nn.init.zeros_(self.linear.bias)
+        layers = []
+        for _ in range(depth):
+            lin = nn.Linear(dim, dim, bias=True)
+            with torch.no_grad():
+                nn.init.eye_(lin.weight)
+                nn.init.zeros_(lin.bias)
+            layers.append(lin)
+            layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        return F.relu(self.linear(x)) + self.eps
+        return self.net(x) + self.eps
 
 
 class SpectralGate(nn.Module):
@@ -129,7 +136,8 @@ class SpectralGate(nn.Module):
 class WaveFieldAttention(nn.Module):
 
     def __init__(self, embedding_dim, num_heads, field_size=512, max_seq_len=128,
-                 n_components=1, local_window=0, device='cuda'):
+                 n_components=1, local_window=0, use_analytic_kernel=True,
+                 feature_map_depth=2, device='cuda'):
         super().__init__()
 
         self.embedding_dim = embedding_dim
@@ -139,6 +147,7 @@ class WaveFieldAttention(nn.Module):
         self.max_seq_len = max_seq_len
         self.n_components = n_components
         self.local_window = local_window
+        self.use_analytic_kernel = use_analytic_kernel
         self.device = device
 
         assert embedding_dim % num_heads == 0
@@ -153,9 +162,9 @@ class WaveFieldAttention(nn.Module):
             self.qkvg_proj.bias[3 * embedding_dim:].fill_(2.0)
 
         # V4.3: Learned feature maps (Hedgehog-style, identity-init)
-        # Separate maps for Q and K so they can specialize independently
-        self.q_feature_map = LearnedFeatureMap(self.head_dim)
-        self.k_feature_map = LearnedFeatureMap(self.head_dim)
+        # depth=1: single Linear+ReLU (original). depth=2: 2-layer MLP (Hedgehog).
+        self.q_feature_map = LearnedFeatureMap(self.head_dim, depth=feature_map_depth)
+        self.k_feature_map = LearnedFeatureMap(self.head_dim, depth=feature_map_depth)
 
         # V4.3: Content-adaptive spectral gate (SPECTRE-style)
         # rfft(n=2*G) produces G+1 complex frequency bins
@@ -215,8 +224,9 @@ class WaveFieldAttention(nn.Module):
 
         # ---- LOCAL ATTENTION (near-field) ----
         if local_window > 0:
-            # Per-head blend: sigmoid(0) = 0.5 — equal mix of wave and local
-            self.local_blend = nn.Parameter(torch.zeros(H))
+            # Per-head blend: sigmoid(1.0) = 0.73 — biased toward local at init
+            # BASED (Hazy Research 2024) showed local patterns dominate short-range
+            self.local_blend = nn.Parameter(torch.full((H,), 1.0))
 
             # Precompute causal + window mask (registered buffer → moves with .to(device))
             rows = torch.arange(max_seq_len).unsqueeze(1)
@@ -303,6 +313,101 @@ class WaveFieldAttention(nn.Module):
             self._kernel_param_snapshot = [p.clone() for p in cache_keys]
 
         return result
+
+    def _build_analytic_kernel_fft(self, device):
+        """Analytic FFT of complex exponential kernel via Z-transform (S4D-style).
+
+        Instead of materializing G time-domain samples and FFTing, computes the
+        DFT directly from complex poles using the geometric series closed form:
+
+          H(z_k) = (1 - exp(lambda*G) * z_k^{-G}) / (1 - exp(lambda) * z_k^{-1})
+
+        where lambda = -alpha + i*omega is the complex pole per head, and
+        z_k = exp(i*2*pi*k / 2G) are the DFT frequency bins.
+
+        The real kernel (conjugate pair) is: c*H(z) + conj(c)*H(conj(z))
+        where c = exp(i*phi) applies the phase offset.
+
+        Benefits over time-domain approach:
+          - Automatic causality (sums only t >= 0, no _enforce_causal_kernel needed)
+          - Direct gradient flow through pole params (alpha, omega) to loss
+          - Kramers-Kronig compliant by construction
+          - Minimum-phase property when alpha > 0
+
+        Returns: (H, freq_bins) complex — same format as _build_wave_kernels.
+        Only supports single-component (C=1) kernels.
+        """
+        # Eval caching (same logic as _build_wave_kernels)
+        if not self.training:
+            cache_keys = [self.wave_frequency.data, self.wave_damping.data, self.wave_phase.data]
+            if self._kernel_fft_cache is not None and self._kernel_param_snapshot is not None:
+                if all(s.equal(c) for s, c in zip(self._kernel_param_snapshot, cache_keys)):
+                    return self._kernel_fft_cache
+
+        G = self.field_size
+        pad_size = 2 * G
+        freq_bins = G + 1  # rfft output size for n=2*G
+
+        # Complex pole: lambda = -alpha + i*omega
+        alpha = F.softplus(self.wave_damping)  # (H,) positive damping
+        omega = self.wave_frequency             # (H,) frequency
+        phi = self.wave_phase                   # (H,) phase
+
+        # Build complex quantities (all in float32)
+        lam = torch.complex(-alpha.float(), omega.float())                  # (H,)
+        c = torch.complex(torch.cos(phi.float()), torch.sin(phi.float()))   # (H,) = e^{i*phi}
+
+        # DFT frequency bins: z_k = exp(i * 2*pi*k / pad_size)
+        k = torch.arange(freq_bins, device=device, dtype=torch.float32)
+        z_angles = 2.0 * math.pi * k / pad_size                             # (freq_bins,)
+        z = torch.complex(torch.cos(z_angles), torch.sin(z_angles))         # (freq_bins,)
+
+        # Geometric sum: H(z) = (1 - exp(lam*G)*z^{-G}) / (1 - exp(lam)*z^{-1})
+        # Reshape for broadcasting: (H, 1) x (1, freq_bins)
+        exp_lam = torch.exp(lam).unsqueeze(1)      # (H, 1) per-step decay
+        exp_lam_G = torch.exp(lam * G).unsqueeze(1) # (H, 1) total decay over G
+        c_bc = c.unsqueeze(1)                        # (H, 1)
+        z_bc = z.unsqueeze(0)                        # (1, freq_bins)
+
+        z_inv = 1.0 / z_bc                           # z^{-1}
+        z_inv_G = z_inv ** G                          # z^{-G}
+
+        numerator = 1.0 - exp_lam_G * z_inv_G        # (H, freq_bins)
+        denominator = 1.0 - exp_lam * z_inv           # (H, freq_bins)
+
+        # Numerical safety: clamp denominator away from zero
+        # (pole on unit circle = exp(lam)*z^{-1} = 1, impossible when alpha > 0)
+        denom_safe = denominator + 1e-10 * torch.sgn(denominator) * (denominator.abs() < 1e-10)
+
+        H_z = numerator / denom_safe                  # (H, freq_bins) complex
+
+        # Conjugate pole: lam* = -alpha - i*omega
+        # H_{lam*}(z_k) uses conj(exp(lam)) but SAME z_k^{-1} (not conj(z_k^{-1}))
+        # This is NOT the same as conj(H_lam(z_k)) since conj(z_k^{-1}) = z_k
+        exp_lam_conj = exp_lam.conj()                  # (H, 1)
+        exp_lam_G_conj = exp_lam_G.conj()              # (H, 1)
+
+        numer_conj = 1.0 - exp_lam_G_conj * z_inv_G   # (H, freq_bins)
+        denom_conj = 1.0 - exp_lam_conj * z_inv        # (H, freq_bins)
+        denom_conj_safe = denom_conj + 1e-10 * torch.sgn(denom_conj) * (denom_conj.abs() < 1e-10)
+
+        H_z_conj = numer_conj / denom_conj_safe        # (H, freq_bins) complex
+
+        # Real kernel DFT = c * H_lam(z) + conj(c) * H_{lam*}(z)
+        # This is the DFT of k(t) = Re[c * exp(lam*t)] (the real cosine kernel)
+        kernel_fft = c_bc * H_z + c_bc.conj() * H_z_conj  # (H, freq_bins) complex
+
+        # Normalize by DC component (same effect as L1 normalization in time domain)
+        dc = kernel_fft[:, 0:1].real.abs().clamp(min=1e-8)
+        kernel_fft = kernel_fft / dc
+
+        # Cache (eval only)
+        if not self.training:
+            cache_keys = [self.wave_frequency.data, self.wave_damping.data, self.wave_phase.data]
+            self._kernel_fft_cache = kernel_fft
+            self._kernel_param_snapshot = [p.clone() for p in cache_keys]
+
+        return kernel_fft
 
     def _enforce_causal_kernel(self, kernel_fft, G):
         """Project a frequency-domain kernel back to causal (zero for t >= G).
@@ -460,7 +565,14 @@ class WaveFieldAttention(nn.Module):
 
         # SCATTER → MODULATE → CONVOLVE → COUPLE → GATHER
         field = self._bilinear_scatter(deposit, field_pos_float, B, H, G, head_dim, x.device)
-        base_kernel_fft = self._build_wave_kernels(x.device)
+
+        # V4.3: Analytic kernel via Z-transform (S4D-style complex exponentials)
+        # computes DFT directly from poles — automatic causality, better gradients.
+        # Falls back to legacy time-domain rfft for multi-component or when disabled.
+        if self.use_analytic_kernel and self.n_components == 1:
+            base_kernel_fft = self._build_analytic_kernel_fft(x.device)
+        else:
+            base_kernel_fft = self._build_wave_kernels(x.device)
 
         # V4.3: Content-adaptive spectral modulation (SPECTRE-style)
         # MLP(mean(Q)) → per-head spectral gate → input-dependent kernel
