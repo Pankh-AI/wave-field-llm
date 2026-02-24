@@ -1,6 +1,8 @@
 services:
-  benchmark:
+  # S1: 22M params, 20M tokens (~25 min on 3060)
+  s1:
     build: .
+    container_name: wave-s1
     deploy:
       resources:
         reservations:
@@ -12,5 +14,61 @@ services:
       - ./results:/app/results
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - BENCHMARK=${BENCHMARK:-benchmarks/benchmark_v43.py}
-    # Override per run: docker compose run benchmark python benchmarks/benchmark_v42.py
+      - BENCHMARK=benchmarks/benchmark_scaling.py
+      - SCALE=S1
+      - DATASET=2
+
+  # S2: 55M params, 50M tokens (~2.3 hrs on 3060)
+  s2:
+    build: .
+    container_name: wave-s2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - BENCHMARK=benchmarks/benchmark_scaling.py
+      - SCALE=S2
+      - DATASET=2
+
+  # S3: 100M params, 100M tokens (~9 hrs on 3060, needs WikiText-103)
+  s3:
+    build: .
+    container_name: wave-s3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - BENCHMARK=benchmarks/benchmark_scaling.py
+      - SCALE=S3
+      - DATASET=103
+
+  # V4.3 benchmark (original 5M token comparison)
+  v43:
+    build: .
+    container_name: wave-v43
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - BENCHMARK=benchmarks/benchmark_v43.py

@@ -287,7 +287,8 @@ class WaveFieldAttention(nn.Module):
             weights = F.softmax(self.component_weights, dim=-1).unsqueeze(2)  # (H, C, 1)
             kernels = (weights * components).sum(dim=1)  # (H, G)
 
-        # Normalize and FFT
+        # Normalize and FFT (always fp32 for numerical stability)
+        kernels = kernels.float()
         kernel_sum = kernels.abs().sum(dim=1, keepdim=True).clamp(min=1e-8)
         kernels = kernels / kernel_sum
 
@@ -313,7 +314,10 @@ class WaveFieldAttention(nn.Module):
         pad_size = 2 * G
 
         field_t = field.permute(0, 3, 1, 2).reshape(B * D, H, G)
-        field_fft = torch.fft.rfft(field_t, n=pad_size)
+
+        # FFT in fp32 for numerical stability (bf16 twiddle factors lose precision)
+        input_dtype = field_t.dtype
+        field_fft = torch.fft.rfft(field_t.float(), n=pad_size)
 
         if kernel_fft.dim() == 3:
             # Content-adaptive: (B, H, freq_bins) → expand over D
@@ -324,6 +328,7 @@ class WaveFieldAttention(nn.Module):
             convolved_fft = field_fft * kernel_fft.unsqueeze(0)
 
         convolved = torch.fft.irfft(convolved_fft, n=pad_size)[:, :, :G]
+        convolved = convolved.to(input_dtype)
 
         return convolved.reshape(B, D, H, G).permute(0, 2, 3, 1)
 

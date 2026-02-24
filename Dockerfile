@@ -16,6 +16,11 @@ COPY . .
 # Results directory (volume mount target)
 RUN mkdir -p /app/results
 
-# Default benchmark — override with BENCHMARK env var or docker compose command
-ENV BENCHMARK=benchmarks/benchmark_v43.py
-CMD python ${BENCHMARK}
+# Benchmark config — override any of these at runtime
+ENV BENCHMARK=benchmarks/benchmark_scaling.py
+ENV SCALE=""
+ENV DATASET=2
+ENV MODEL=""
+ENV CONFIGS=""
+
+CMD ["sh", "-c", "python $BENCHMARK"]
