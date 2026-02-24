@@ -493,13 +493,16 @@ def main():
                     use_3d_interference=False,
                 ).to(device)
 
-            # Apply torch.compile optimizations
-            if cfg['type'] == 'wave' and hasattr(model, 'compile_model'):
-                model.compile_model()
-                print(f"  [compile] Wave Field: selective torch.compile applied")
-            elif cfg['type'] == 'standard' and hasattr(torch, 'compile'):
-                model = torch.compile(model)
-                print(f"  [compile] Standard: torch.compile applied")
+            # Apply torch.compile optimizations (try/except: runtime image may lack gcc)
+            try:
+                if cfg['type'] == 'wave' and hasattr(model, 'compile_model'):
+                    model.compile_model()
+                    print(f"  [compile] Wave Field: selective torch.compile applied")
+                elif cfg['type'] == 'standard' and hasattr(torch, 'compile'):
+                    model = torch.compile(model)
+                    print(f"  [compile] Standard: torch.compile applied")
+            except Exception as e:
+                print(f"  [compile] skipped ({e})")
 
             result = train_run(model, train_ids, val_ids, vocab_size,
                                device, cfg, use_amp)
