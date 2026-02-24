@@ -210,8 +210,8 @@ def create_batches(data, batch_size, device, shuffle=True):
     batches = []
     for start in range(0, len(indices), batch_size):
         batch_idx = indices[start:start + batch_size]
-        bx = torch.stack([data[i][0] for i in batch_idx]).to(device)
-        by = torch.stack([data[i][1] for i in batch_idx]).to(device)
+        bx = torch.stack([data[i][0] for i in batch_idx]).to(device, non_blocking=True)
+        by = torch.stack([data[i][1] for i in batch_idx]).to(device, non_blocking=True)
         batches.append((bx, by))
     return batches
 
@@ -435,10 +435,17 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = device.type == 'cuda'
+
+    # TF32 for Ampere+ GPUs: ~2x speedup on fp32 matmul/FFT operations
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cudnn.benchmark = True
+
     print(f"\n  Device: {device}")
     if device.type == 'cuda':
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"  TF32: enabled | cudnn.benchmark: enabled")
 
     tok, train_ids, val_ids = load_cached_data(vocab_size=8000)
     vocab_size = tok.vocab_size_actual()
@@ -493,14 +500,18 @@ def main():
                     use_3d_interference=False,
                 ).to(device)
 
-            # Apply torch.compile optimizations (try/except: runtime image may lack gcc)
+            # torch.compile: only beneficial at 50M+ params (overhead > gain below)
+            n_params = sum(p.numel() for p in model.parameters())
             try:
-                if cfg['type'] == 'wave' and hasattr(model, 'compile_model'):
-                    model.compile_model(mode='default')
-                    print(f"  [compile] Wave Field: selective torch.compile applied")
-                elif cfg['type'] == 'standard' and hasattr(torch, 'compile'):
-                    model = torch.compile(model)
-                    print(f"  [compile] Standard: torch.compile applied")
+                if n_params >= 50_000_000:
+                    if cfg['type'] == 'wave' and hasattr(model, 'compile_model'):
+                        model.compile_model(mode='default')
+                        print(f"  [compile] Wave Field: torch.compile applied")
+                    elif cfg['type'] == 'standard' and hasattr(torch, 'compile'):
+                        model = torch.compile(model)
+                        print(f"  [compile] Standard: torch.compile applied")
+                else:
+                    print(f"  [compile] skipped ({n_params/1e6:.0f}M params < 50M threshold)")
             except Exception as e:
                 print(f"  [compile] skipped ({e})")
 
