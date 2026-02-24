@@ -73,14 +73,31 @@ class ELUPlus1(nn.Module):
         return F.elu(x) + 1.0
 
 
+class NormalizedExp(nn.Module):
+    """Normalized exp activation for high-rank feature maps (Hedgehog, ICLR 2024).
+
+    exp(x - max(x)) produces sharp, concentrated outputs where different inputs
+    map to exponentially different values. This preserves effective rank >> 2
+    unlike ELU+1 which compresses everything to ~2.0 (std/mean ≈ 0.13).
+
+    The max-subtraction prevents overflow while preserving relative differences.
+    """
+
+    def forward(self, x):
+        return torch.exp(x - x.detach().amax(dim=-1, keepdim=True))
+
+
 class LearnedFeatureMap(nn.Module):
     """Learned positive feature map for linear attention (Hedgehog, ICLR 2024).
 
-    MLP of `depth` identity-initialized Linear(d,d) + ELU+1 layers.
-    At init: phi(x) = ELU(Ix)+1 — always positive, no dead neurons.
+    MLP of `depth` identity-initialized Linear(d,d) + activation layers.
+    At init: phi(x) = act(Ix) — always positive, distinct per token.
     During training: learns spiky, dot-product-monotonic maps that mimic softmax.
 
     V4.3.2: Replaced ReLU with ELU+1 to fix 35-55% dead neuron problem.
+    V4.3.4: Replaced ELU+1 with NormalizedExp to fix rank-2 collapse.
+             ELU+1 maps everything to ~2.0 (std/mean=0.13, rank=2).
+             NormalizedExp preserves exponential separation (rank >> 2).
 
     depth=1: original V4.3 (single linear).
     depth=2: Hedgehog-style (closes 68.6% of linear-vs-softmax gap at 125M scale).
@@ -96,7 +113,7 @@ class LearnedFeatureMap(nn.Module):
                 nn.init.eye_(lin.weight)
                 nn.init.zeros_(lin.bias)
             layers.append(lin)
-            layers.append(ELUPlus1())
+            layers.append(NormalizedExp())
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -134,9 +151,11 @@ class SpectralGate(nn.Module):
             nn.Linear(input_dim, num_heads * n_control),
         )
 
-        # Near-zero init: at start, gate ≈ 0 → modulated ≈ base kernel
+        # Small init: gate starts near 0 but large enough to develop during training.
+        # V4.3.3 used 0.01 → gate never exceeded w_max=0.07 after 20M tokens.
+        # V4.3.4: 0.1 init gives gate room to grow while still safe (modulated ≈ base).
         with torch.no_grad():
-            self.net[-1].weight.mul_(0.01)
+            self.net[-1].weight.mul_(0.1)
             self.net[-1].bias.zero_()
 
     def forward(self, q, base_kernel_fft):
@@ -282,8 +301,10 @@ class WaveFieldAttention(nn.Module):
                 [math.pi * (2 * n + 1) / 2 for n in range(H)]
             ) * freq_scale
 
-            # Damping: softplus(-1.4)=0.22 (L0, long reach) to softplus(0.0)=0.69 (last, local)
-            damp_raw = -1.4 + 1.4 * layer_frac if num_layers > 1 else -0.69
+            # Damping: softplus(-3.0)=0.05 (L0, very long reach) to softplus(0.0)=0.69 (last, local)
+            # V4.3.3 used -1.4 → softplus=0.22 → reach=3-5 positions (too short).
+            # V4.3.4: -3.0 → softplus=0.05 → reach ~20 positions for early layers.
+            damp_raw = -3.0 + 3.0 * layer_frac if num_layers > 1 else -0.69
             hippo_damp = torch.full((H,), damp_raw)
 
             # Phase: offset per layer for inter-layer diversity

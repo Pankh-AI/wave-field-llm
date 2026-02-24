@@ -329,9 +329,15 @@ class WaveFieldTransformer(nn.Module):
                             nn.init.eye_(module.weight)
                             nn.init.zeros_(module.bias)
 
-                # Spectral gate: restore near-zero output init (skip if kernel mixture)
+                # Spectral gate: restore output init (skip if kernel mixture)
+                # V4.3.4: 0.1 scale (was 0.001) — gate needs room to develop.
+                # At 0.001, gate w_max never exceeded 0.07 after 20M tokens.
                 if attn.spectral_gate is not None:
-                    nn.init.normal_(attn.spectral_gate.net[-1].weight, 0, 0.001)
+                    with torch.no_grad():
+                        attn.spectral_gate.net[-1].weight.mul_(0.0)
+                        attn.spectral_gate.net[-1].weight.add_(
+                            torch.randn_like(attn.spectral_gate.net[-1].weight) * 0.1
+                        )
                     nn.init.zeros_(attn.spectral_gate.net[-1].bias)
 
                 # Kernel mixture: restore zero init for projection, warm bias for basis 1
