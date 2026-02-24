@@ -361,8 +361,8 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
     # torch.compile: selective compilation of non-FFT submodules
     if torch.cuda.is_available() and hasattr(model, 'compile_model'):
         try:
-            model.compile_model(mode='reduce-overhead')
-            print("  torch.compile: enabled (reduce-overhead)")
+            model.compile_model(mode='default')
+            print("  torch.compile: enabled (default mode)")
         except Exception as e:
             print(f"  torch.compile: skipped ({e})")
 

@@ -496,7 +496,7 @@ def main():
             # Apply torch.compile optimizations (try/except: runtime image may lack gcc)
             try:
                 if cfg['type'] == 'wave' and hasattr(model, 'compile_model'):
-                    model.compile_model()
+                    model.compile_model(mode='default')
                     print(f"  [compile] Wave Field: selective torch.compile applied")
                 elif cfg['type'] == 'standard' and hasattr(torch, 'compile'):
                     model = torch.compile(model)
