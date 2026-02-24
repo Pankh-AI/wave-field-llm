@@ -724,6 +724,269 @@ def main():
                 json.dump({'metadata': run_metadata, 'results': scale_results}, f, indent=2)
             print(f"  Scale {scale_key} saved: {scale_path}")
 
+    # ============================================================
+    # VISUALIZATIONS
+    # ============================================================
+    plot_results(all_results, scale_keys, results_dir, dataset_name)
+
+    # ============================================================
+    # INFERENCE TEST (if wave checkpoint exists)
+    # ============================================================
+    run_inference_test(all_results, scale_keys, vocab_size, tok, device, results_dir)
+
+
+# ======================================================================
+# VISUALIZATION
+# ======================================================================
+
+def plot_results(all_results, scale_keys, results_dir, dataset_name):
+    """Generate training curve plots and comparison charts."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  matplotlib not available, skipping plots")
+        return
+
+    # --- Plot 1: Training Curves (PPL over tokens) ---
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    # PPL curves
+    ax = axes[0]
+    for r in all_results:
+        curve = r.get('curve', [])
+        if not curve:
+            continue
+        tokens = [p['tokens_M'] for p in curve]
+        ppls = [p['ppl'] for p in curve]
+        label = r['run_name']
+        style = '-' if 'SPECTRE' in label else '--'
+        color = '#2196F3' if 'SPECTRE' in label else '#FF5722'
+        ax.plot(tokens, ppls, style, label=label, color=color, linewidth=2)
+    ax.set_xlabel('Tokens (M)', fontsize=12)
+    ax.set_ylabel('Perplexity', fontsize=12)
+    ax.set_title(f'Training Curves — PPL ({dataset_name})', fontsize=14)
+    ax.set_yscale('log')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Accuracy curves
+    ax = axes[1]
+    for r in all_results:
+        curve = r.get('curve', [])
+        if not curve:
+            continue
+        tokens = [p['tokens_M'] for p in curve]
+        accs = [p['acc'] for p in curve]
+        label = r['run_name']
+        style = '-' if 'SPECTRE' in label else '--'
+        color = '#2196F3' if 'SPECTRE' in label else '#FF5722'
+        ax.plot(tokens, accs, style, label=label, color=color, linewidth=2)
+    ax.set_xlabel('Tokens (M)', fontsize=12)
+    ax.set_ylabel('Accuracy (%)', fontsize=12)
+    ax.set_title(f'Training Curves — Accuracy ({dataset_name})', fontsize=14)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(results_dir, 'training_curves.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Plot saved: {path}")
+
+    # --- Plot 2: Final Results Bar Chart ---
+    wave_results = [r for r in all_results if r.get('model_type') == 'wave'
+                    and isinstance(r.get('best_ppl'), (int, float))]
+    std_results = [r for r in all_results if r.get('model_type') == 'standard'
+                   and isinstance(r.get('best_ppl'), (int, float))]
+
+    if wave_results or std_results:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # PPL comparison
+        ax = axes[0]
+        labels, wave_ppls, std_ppls = [], [], []
+        for sk in scale_keys:
+            w = next((r for r in wave_results if r.get('scale') == sk), None)
+            s = next((r for r in std_results if r.get('scale') == sk), None)
+            if w or s:
+                labels.append(sk)
+                wave_ppls.append(w['best_ppl'] if w else 0)
+                std_ppls.append(s['best_ppl'] if s else 0)
+        x = range(len(labels))
+        if wave_ppls:
+            ax.bar([i - 0.2 for i in x], wave_ppls, 0.35, label='SPECTRE-Wave', color='#2196F3')
+        if std_ppls:
+            ax.bar([i + 0.2 for i in x], std_ppls, 0.35, label='Standard', color='#FF5722')
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(labels)
+        ax.set_ylabel('Perplexity (lower = better)')
+        ax.set_title('Best PPL by Scale')
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+
+        # Accuracy comparison
+        ax = axes[1]
+        wave_accs, std_accs = [], []
+        for sk in scale_keys:
+            w = next((r for r in wave_results if r.get('scale') == sk), None)
+            s = next((r for r in std_results if r.get('scale') == sk), None)
+            wave_accs.append(w['best_acc'] if w else 0)
+            std_accs.append(s['best_acc'] if s else 0)
+        if wave_accs:
+            ax.bar([i - 0.2 for i in x], wave_accs, 0.35, label='SPECTRE-Wave', color='#2196F3')
+        if std_accs:
+            ax.bar([i + 0.2 for i in x], std_accs, 0.35, label='Standard', color='#FF5722')
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(labels)
+        ax.set_ylabel('Accuracy (%)')
+        ax.set_title('Best Accuracy by Scale')
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+
+        # Throughput comparison
+        ax = axes[2]
+        wave_tps, std_tps = [], []
+        for sk in scale_keys:
+            w = next((r for r in wave_results if r.get('scale') == sk), None)
+            s = next((r for r in std_results if r.get('scale') == sk), None)
+            wave_tps.append(w.get('tokens_per_sec', 0) if w else 0)
+            std_tps.append(s.get('tokens_per_sec', 0) if s else 0)
+        if wave_tps:
+            ax.bar([i - 0.2 for i in x], wave_tps, 0.35, label='SPECTRE-Wave', color='#2196F3')
+        if std_tps:
+            ax.bar([i + 0.2 for i in x], std_tps, 0.35, label='Standard', color='#FF5722')
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(labels)
+        ax.set_ylabel('Tokens/sec')
+        ax.set_title('Throughput by Scale')
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        path = os.path.join(results_dir, 'scaling_comparison.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Plot saved: {path}")
+
+    # --- Plot 3: Step-by-step monitoring (PPL evolution per eval) ---
+    for r in all_results:
+        curve = r.get('curve', [])
+        if len(curve) < 3:
+            continue
+        fig, ax = plt.subplots(figsize=(10, 4))
+        steps = [p['step'] for p in curve]
+        ppls = [p['ppl'] for p in curve]
+        accs = [p['acc'] for p in curve]
+
+        color = '#2196F3' if 'SPECTRE' in r['run_name'] else '#FF5722'
+        ax.plot(steps, ppls, '-o', color=color, markersize=4, label='PPL')
+        ax.set_xlabel('Step')
+        ax.set_ylabel('PPL', color=color)
+        ax.set_yscale('log')
+        ax.tick_params(axis='y', labelcolor=color)
+
+        ax2 = ax.twinx()
+        ax2.plot(steps, accs, '-s', color='#4CAF50', markersize=4, alpha=0.7, label='Acc')
+        ax2.set_ylabel('Accuracy (%)', color='#4CAF50')
+        ax2.tick_params(axis='y', labelcolor='#4CAF50')
+
+        ax.set_title(f'{r["run_name"]} — Step Monitor ({dataset_name})')
+        ax.grid(True, alpha=0.2)
+
+        safe = r['run_name'].replace(' ', '_').lower()
+        path = os.path.join(results_dir, f'monitor_{safe}.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Monitor plot saved: {path}")
+
+
+# ======================================================================
+# INFERENCE TEST
+# ======================================================================
+
+def run_inference_test(all_results, scale_keys, vocab_size, tok, device, results_dir):
+    """Load best wave checkpoint and generate sample text."""
+    import torch.nn.functional as F
+
+    # Find the wave checkpoint
+    ckpt_path = None
+    for r in all_results:
+        if r.get('model_type') == 'wave' and isinstance(r.get('best_ppl'), (int, float)):
+            safe_name = r['run_name'].replace(' ', '_').lower()
+            candidate = os.path.join(results_dir, f'{safe_name}.pt')
+            if os.path.exists(candidate):
+                ckpt_path = candidate
+                scale_key = r['scale']
+                break
+
+    if not ckpt_path:
+        print("\n  No wave checkpoint found, skipping inference test")
+        return
+
+    print(f"\n{'='*72}")
+    print(f"  INFERENCE TEST — {ckpt_path}")
+    print(f"{'='*72}")
+
+    cfg = SCALE_CONFIGS[scale_key]
+    model = WaveFieldTransformer(
+        vocab_size=vocab_size,
+        embedding_dim=cfg['embedding_dim'],
+        num_layers=cfg['num_layers'],
+        num_heads=cfg['num_heads'],
+        ffn_dim=cfg['ffn_dim'],
+        field_size=cfg['field_size'],
+        max_seq_len=cfg['seq_len'] + 2,
+        dropout=0.0,
+        use_checkpoint=False,
+        interference_interval=3,
+        n_components=1,
+        local_window=0,
+        device=device,
+    ).to(device)
+
+    state = torch.load(ckpt_path, map_location=device, weights_only=True)
+    model.load_state_dict(state)
+    model.eval()
+    print(f"  Loaded {sum(p.numel() for p in model.parameters()):,} params")
+
+    prompts = [
+        "The history of",
+        "In recent years, scientists have",
+        "The city of London",
+        "During the war,",
+        "The president announced",
+    ]
+
+    for prompt in prompts:
+        ids = tok.encode(prompt)
+        input_ids = torch.tensor([ids], device=device)
+        generated = list(ids)
+
+        with torch.no_grad():
+            for _ in range(80):
+                if input_ids.shape[1] > cfg['seq_len']:
+                    input_ids = input_ids[:, -cfg['seq_len']:]
+                logits, _ = model(input_ids)
+                next_logits = logits[0, -1, :] / 0.8
+                # Top-k
+                topk_vals, _ = torch.topk(next_logits, 40)
+                next_logits[next_logits < topk_vals[-1]] = float('-inf')
+                probs = F.softmax(next_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                generated.append(next_token.item())
+                input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
+
+        output = tok.decode(generated)
+        print(f"\n  Prompt: \"{prompt}\"")
+        print(f"  Output: {output[:300]}")
+        print(f"  {'─' * 60}")
+
+    del model
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
 
 if __name__ == '__main__':
     main()

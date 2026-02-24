@@ -304,33 +304,58 @@ class WaveFieldAttention(nn.Module):
 
         return result
 
+    def _enforce_causal_kernel(self, kernel_fft, G):
+        """Project a frequency-domain kernel back to causal (zero for t >= G).
+
+        Spectral gate modulation can break the Kramers-Kronig relation,
+        introducing anti-causal components (non-zero at positions G..2G-1).
+        This enforces causality by round-tripping through time domain:
+          IFFT → zero anti-causal half → FFT.
+
+        kernel_fft: (..., freq_bins) complex — static (H,F) or adaptive (B,H,F)
+        Returns: same shape, causal-projected.
+        """
+        pad_size = 2 * G
+        kernel_td = torch.fft.irfft(kernel_fft, n=pad_size)  # (..., 2G)
+        kernel_td[..., G:] = 0  # zero anti-causal half
+        return torch.fft.rfft(kernel_td, n=pad_size)
+
     def _wave_convolve(self, field, kernel_fft):
         """Per-head wave convolution via zero-padded FFT (linear convolution).
 
         kernel_fft: (H, freq_bins) for static kernel, or
                     (B, H, freq_bins) for content-adaptive (spectral gate).
+
+        Uses 4D layout (B, D, H, G) to avoid expanding kernel across D —
+        CUDA broadcasting handles it, saving 16 MB allocation per layer.
         """
         B, H, G, D = field.shape
         pad_size = 2 * G
 
-        field_t = field.permute(0, 3, 1, 2).reshape(B * D, H, G)
+        # Enforce causality: spectral gate modulation can introduce anti-causal
+        # components by breaking the Hilbert transform relationship. Project
+        # back to causal space before convolving.
+        if kernel_fft.dim() == 3:
+            kernel_fft = self._enforce_causal_kernel(kernel_fft, G)
+
+        # Keep 4D: (B, H, G, D) → (B, D, H, G) — FFT along last dim (G)
+        field_t = field.permute(0, 3, 1, 2).contiguous()
 
         # FFT in fp32 for numerical stability (bf16 twiddle factors lose precision)
         input_dtype = field_t.dtype
-        field_fft = torch.fft.rfft(field_t.float(), n=pad_size)
+        field_fft = torch.fft.rfft(field_t.float(), n=pad_size)  # (B, D, H, freq)
 
         if kernel_fft.dim() == 3:
-            # Content-adaptive: (B, H, freq_bins) → expand over D
-            kf = kernel_fft.unsqueeze(1).expand(-1, D, -1, -1).reshape(B * D, H, -1)
-            convolved_fft = field_fft * kf
+            # Content-adaptive: (B, H, freq) → (B, 1, H, freq) broadcasts over D
+            convolved_fft = field_fft * kernel_fft.unsqueeze(1)
         else:
-            # Static: (H, freq_bins) → broadcast over B*D
-            convolved_fft = field_fft * kernel_fft.unsqueeze(0)
+            # Static: (H, freq) broadcasts naturally over (B, D)
+            convolved_fft = field_fft * kernel_fft
 
-        convolved = torch.fft.irfft(convolved_fft, n=pad_size)[:, :, :G]
+        convolved = torch.fft.irfft(convolved_fft, n=pad_size)[..., :G]  # (B, D, H, G)
         convolved = convolved.to(input_dtype)
 
-        return convolved.reshape(B, D, H, G).permute(0, 2, 3, 1)
+        return convolved.permute(0, 2, 3, 1)  # back to (B, H, G, D)
 
     def _bilinear_scatter(self, values, field_pos_float, B, H, G, head_dim, device):
         """Deposit values onto field using bilinear interpolation."""

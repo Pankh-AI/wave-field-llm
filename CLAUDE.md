@@ -85,6 +85,15 @@ Benchmarks use HuggingFace `tokenizers` library for byte-level BPE (8K vocab).
 - **No energy conservation** (V3.5): removed because sparse occupancy + conservation rescaling → signal collapse. Residual connections + LayerNorm handle normalization.
 - **Gate bias = 2.0**: content-dependent gates initialized open so gradients flow freely at start of training.
 - **Static field coupling**: learned cross-head interaction matrix applied after wave convolution, before gating.
+- **fp32 FFT operations**: All FFT/IFFT in `_wave_convolve` and `_build_wave_kernels` are forced to fp32, then cast back to input dtype. bf16 twiddle factors lose precision through butterfly stages (Hyena/H3 best practice).
+- **Param count note**: At "100M config" (embed=768, 12 layers, 12 heads), Wave Field = ~139M params vs Standard = ~110M. The +29M overhead comes from learned feature maps, spectral gate, and interference modules. Accepted as architecture cost.
+
+## Dtype/AMP Guidelines
+
+- **A100/H100**: Use `bf16` autocast, **no** GradScaler (bf16 has same exponent range as fp32).
+- **T4/V100**: Use `fp16` autocast **with** GradScaler (fp16 has narrow exponent range).
+- **CPU**: Use `fp32` fallback, no autocast.
+- FFT operations are always fp32 regardless of autocast dtype (handled internally).
 
 ## Debugging Approach
 
