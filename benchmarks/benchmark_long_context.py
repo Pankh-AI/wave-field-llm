@@ -310,7 +310,10 @@ CONFIGS = [
 def train_run(model, train_ids, val_ids, vocab_size, device, cfg, use_amp):
     seq_len = cfg['seq_len']
     batch_size = cfg['batch_size']
-    token_budget = cfg.get('token_budget', ARCH['token_budget'])
+    # Per-config budget > env var override > default
+    env_budget = os.environ.get('TOKEN_BUDGET', '').strip()
+    token_budget = cfg.get('token_budget',
+                           int(env_budget) if env_budget else ARCH['token_budget'])
     tokens_per_step = batch_size * seq_len
     total_steps = token_budget // tokens_per_step
     params = sum(p.numel() for p in model.parameters())
@@ -489,6 +492,14 @@ def main():
                     use_write_gate=False,
                     use_3d_interference=False,
                 ).to(device)
+
+            # Apply torch.compile optimizations
+            if cfg['type'] == 'wave' and hasattr(model, 'compile_model'):
+                model.compile_model()
+                print(f"  [compile] Wave Field: selective torch.compile applied")
+            elif cfg['type'] == 'standard' and hasattr(torch, 'compile'):
+                model = torch.compile(model)
+                print(f"  [compile] Standard: torch.compile applied")
 
             result = train_run(model, train_ids, val_ids, vocab_size,
                                device, cfg, use_amp)
