@@ -101,11 +101,14 @@ class LearnedFeatureMap(nn.Module):
 
     depth=1: original V4.3 (single linear).
     depth=2: Hedgehog-style (closes 68.6% of linear-vs-softmax gap at 125M scale).
+
+    activation: 'normalized_exp' (default, V4.3.4) or 'elu_plus_1' (V4.3.3).
     """
 
-    def __init__(self, dim, eps=1e-6, depth=2):
+    def __init__(self, dim, eps=1e-6, depth=2, activation='normalized_exp'):
         super().__init__()
         self.eps = eps
+        act_fn = NormalizedExp() if activation == 'normalized_exp' else ELUPlus1()
         layers = []
         for _ in range(depth):
             lin = nn.Linear(dim, dim, bias=True)
@@ -113,7 +116,8 @@ class LearnedFeatureMap(nn.Module):
                 nn.init.eye_(lin.weight)
                 nn.init.zeros_(lin.bias)
             layers.append(lin)
-            layers.append(NormalizedExp())
+            layers.append(act_fn if _ == 0 else
+                          (NormalizedExp() if activation == 'normalized_exp' else ELUPlus1()))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -136,7 +140,7 @@ class SpectralGate(nn.Module):
     At init, MLP output ≈ 0, so modulated ≈ base kernel (safe start).
     """
 
-    def __init__(self, num_heads, head_dim, freq_bins, n_control=32):
+    def __init__(self, num_heads, head_dim, freq_bins, n_control=32, init_scale=0.1):
         super().__init__()
         self.num_heads = num_heads
         self.freq_bins = freq_bins
@@ -154,8 +158,9 @@ class SpectralGate(nn.Module):
         # Small init: gate starts near 0 but large enough to develop during training.
         # V4.3.3 used 0.01 → gate never exceeded w_max=0.07 after 20M tokens.
         # V4.3.4: 0.1 init gives gate room to grow while still safe (modulated ≈ base).
+        self.init_scale = init_scale
         with torch.no_grad():
-            self.net[-1].weight.mul_(0.1)
+            self.net[-1].weight.mul_(init_scale)
             self.net[-1].bias.zero_()
 
     def forward(self, q, base_kernel_fft):
@@ -191,7 +196,11 @@ class WaveFieldAttention(nn.Module):
                  use_3d_interference=False,
                  use_kernel_mixture=False, num_basis_kernels=4,
                  layer_idx=0, num_layers=1,
-                 device='cuda'):
+                 device='cuda',
+                 # V4.3.4 ablation knobs (defaults = V4.3.4 production values)
+                 feature_map_activation='normalized_exp',
+                 spectral_gate_init_scale=0.1,
+                 damping_range=(-3.0, 0.0)):
         super().__init__()
 
         self.embedding_dim = embedding_dim
@@ -223,8 +232,10 @@ class WaveFieldAttention(nn.Module):
 
         # V4.3: Learned feature maps (Hedgehog-style, identity-init)
         # depth=1: single Linear+ReLU (original). depth=2: 2-layer MLP (Hedgehog).
-        self.q_feature_map = LearnedFeatureMap(self.head_dim, depth=feature_map_depth)
-        self.k_feature_map = LearnedFeatureMap(self.head_dim, depth=feature_map_depth)
+        self.q_feature_map = LearnedFeatureMap(self.head_dim, depth=feature_map_depth,
+                                                activation=feature_map_activation)
+        self.k_feature_map = LearnedFeatureMap(self.head_dim, depth=feature_map_depth,
+                                                activation=feature_map_activation)
 
         # V4.4: Selective write gate (GLA-inspired)
         # Controls per-token, per-head write strength to wave field.
@@ -282,6 +293,7 @@ class WaveFieldAttention(nn.Module):
                 head_dim=self.head_dim,
                 freq_bins=self.freq_bins,
                 n_control=32,
+                init_scale=spectral_gate_init_scale,
             )
 
         # ---- WAVE KERNEL PARAMETERS ----
@@ -301,10 +313,11 @@ class WaveFieldAttention(nn.Module):
                 [math.pi * (2 * n + 1) / 2 for n in range(H)]
             ) * freq_scale
 
-            # Damping: softplus(-3.0)=0.05 (L0, very long reach) to softplus(0.0)=0.69 (last, local)
-            # V4.3.3 used -1.4 → softplus=0.22 → reach=3-5 positions (too short).
-            # V4.3.4: -3.0 → softplus=0.05 → reach ~20 positions for early layers.
-            damp_raw = -3.0 + 3.0 * layer_frac if num_layers > 1 else -0.69
+            # Damping: range controlled by damping_range parameter
+            # V4.3.3 used (-1.4, 0.0): softplus(-1.4)=0.22 → reach=3-5 positions (too short).
+            # V4.3.4 uses (-3.0, 0.0): softplus(-3.0)=0.05 → reach ~20 positions for early layers.
+            damp_lo, damp_hi = damping_range
+            damp_raw = damp_lo + (damp_hi - damp_lo) * layer_frac if num_layers > 1 else -0.69
             hippo_damp = torch.full((H,), damp_raw)
 
             # Phase: offset per layer for inter-layer diversity

@@ -22,6 +22,11 @@ Usage:
   MODEL=wave python benchmarks/benchmark_scaling.py
   MODEL=standard python benchmarks/benchmark_scaling.py
 
+  # Reproducibility + tracking:
+  SEED=42 python benchmarks/benchmark_scaling.py    # set random seed (default: 42)
+  WANDB=0 python benchmarks/benchmark_scaling.py    # disable wandb logging
+  RESUME=1 python benchmarks/benchmark_scaling.py   # auto-resume from checkpoint
+
 Data: WikiText-103 (103M tokens) — auto-downloads via HuggingFace datasets.
       WikiText-2 used as fallback if WikiText-103 fails.
 
@@ -40,7 +45,30 @@ import json
 import gc
 import os
 import sys
+import random
 import traceback
+import numpy as np
+
+# Optional wandb (disable with WANDB=0 or if not installed)
+_wandb_available = False
+if os.environ.get('WANDB', '1') != '0':
+    try:
+        import wandb
+        _wandb_available = True
+    except ImportError:
+        pass
+
+
+def set_seed(seed: int):
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Deterministic convolutions (may slow down, but reproducible)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.wave_field_transformer import WaveFieldTransformer
@@ -170,8 +198,17 @@ SCALE_CONFIGS = {
 # BPE TOKENIZER
 # ======================================================================
 
-def train_bpe_tokenizer(train_texts, vocab_size=8000):
+def train_bpe_tokenizer(train_texts, vocab_size=8000, cache_dir=None):
+    """Train BPE tokenizer with caching. Returns same tokenizer for same data+vocab."""
     from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+
+    # Check cache first
+    if cache_dir:
+        cache_path = os.path.join(cache_dir, f'bpe_vocab{vocab_size}.json')
+        if os.path.exists(cache_path):
+            print(f"  Loading cached tokenizer: {cache_path}")
+            return Tokenizer.from_file(cache_path)
+
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tokenizer.decoder = decoders.ByteLevel()
@@ -181,6 +218,13 @@ def train_bpe_tokenizer(train_texts, vocab_size=8000):
         min_frequency=2,
     )
     tokenizer.train_from_iterator(train_texts, trainer=trainer)
+
+    # Save to cache
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        tokenizer.save(cache_path)
+        print(f"  Tokenizer cached: {cache_path}")
+
     return tokenizer
 
 
@@ -226,12 +270,23 @@ def load_wikitext():
     return splits, dataset_name
 
 
-def tokenize_corpus(lines, tok):
+def tokenize_corpus(lines, tok, cache_path=None):
+    """Tokenize text lines, with optional disk caching."""
+    if cache_path and os.path.exists(cache_path):
+        print(f"  Loading cached tokens: {cache_path}")
+        return np.load(cache_path).tolist()
+
     all_ids = []
     for line in lines:
         ids = tok.encode(line)
         if ids:
             all_ids.extend(ids)
+
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        np.save(cache_path, np.array(all_ids, dtype=np.int32))
+        print(f"  Tokens cached: {cache_path} ({len(all_ids):,} tokens)")
+
     return all_ids
 
 
@@ -347,8 +402,12 @@ def evaluate(model, val_data, batch_size, vocab_size, device, use_amp):
 
 def train_run(model, train_data, val_data, vocab_size, device, run_name,
               total_token_budget, seq_len, batch_size, peak_lr=3e-4,
-              use_amp=True):
+              use_amp=True, scale_key='', model_type='', seed=42,
+              resume_path=None):
     """Train a model and return results dict with training curve."""
+    # Per-run seed for reproducibility (ensures different runs start fresh)
+    set_seed(seed)
+
     params = count_params(model)
     tokens_per_step = batch_size * seq_len
     total_steps = total_token_budget // tokens_per_step
@@ -357,14 +416,42 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
     print(f"  Params: {params:,} | Context: {seq_len} | Batch: {batch_size}")
     print(f"  Token budget: {total_token_budget:,} | Steps: {total_steps:,}")
     print(f"  Train chunks: {len(train_data):,} | Val chunks: {len(val_data):,}")
+    print(f"  Seed: {seed}")
 
-    # torch.compile: selective compilation of non-FFT submodules
-    if torch.cuda.is_available() and hasattr(model, 'compile_model'):
+    # wandb run
+    wb_run = None
+    if _wandb_available:
+        try:
+            wb_run = wandb.init(
+                project="wave-field-llm",
+                name=run_name,
+                config={
+                    'model_type': model_type,
+                    'scale': scale_key,
+                    'params': params,
+                    'seq_len': seq_len,
+                    'batch_size': batch_size,
+                    'token_budget': total_token_budget,
+                    'peak_lr': peak_lr,
+                    'seed': seed,
+                },
+                reinit=True,
+                resume='allow' if resume_path else None,
+            )
+        except Exception as e:
+            print(f"  wandb init failed: {e}")
+            wb_run = None
+
+    # torch.compile: only worth it for models >= 50M params
+    n_params = sum(p.numel() for p in model.parameters())
+    if torch.cuda.is_available() and n_params >= 50_000_000 and hasattr(model, 'compile_model'):
         try:
             model.compile_model(mode='default')
             print("  torch.compile: enabled (default mode)")
         except Exception as e:
             print(f"  torch.compile: skipped ({e})")
+    else:
+        print(f"  torch.compile: skipped ({n_params/1e6:.0f}M params < 50M threshold)")
 
     # V4.3.2: Use per-group LR optimizer if available (kernel params at 50x LR)
     if hasattr(model, 'configure_optimizer'):
@@ -392,13 +479,35 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
     epoch = 0
     curve = []  # training curve data points
 
+    # Resume from checkpoint if available
+    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', 'results')
+    os.makedirs(ckpt_dir, exist_ok=True)
+    safe_name = run_name.replace(' ', '_').lower()
+
+    if resume_path and os.path.exists(resume_path):
+        print(f"  Resuming from: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        scaler.load_state_dict(ckpt['scaler'])
+        scheduler.step_count = ckpt['scheduler_step']
+        step = ckpt['step']
+        epoch = ckpt['epoch']
+        tokens_seen = ckpt['tokens_seen']
+        best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        best_ppl = ckpt.get('best_ppl', float('inf'))
+        best_acc = ckpt.get('best_acc', 0)
+        curve = ckpt.get('curve', [])
+        print(f"  Resumed: step={step}, tokens={tokens_seen/1e6:.1f}M, best_ppl={best_ppl:.1f}")
+
     t0 = time.time()
     eval_interval = max(total_steps // 20, 25)
 
-    # Initial eval (step 0)
-    vl, vp, va = evaluate(model, val_data, batch_size, vocab_size, device, use_amp)
-    curve.append({'step': 0, 'tokens_M': 0, 'ppl': round(vp, 2), 'acc': round(va, 2), 'time_s': 0})
-    print(f"    Step     0/{total_steps} | Tokens 0.0M | Val PPL {vp:>7.1f} Acc {va:>5.1f}% | init", flush=True)
+    if step == 0:
+        # Initial eval (step 0)
+        vl, vp, va = evaluate(model, val_data, batch_size, vocab_size, device, use_amp)
+        curve.append({'step': 0, 'tokens_M': 0, 'ppl': round(vp, 2), 'acc': round(va, 2), 'time_s': 0})
+        print(f"    Step     0/{total_steps} | Tokens 0.0M | Val PPL {vp:>7.1f} Acc {va:>5.1f}% | init", flush=True)
 
     while tokens_seen < total_token_budget:
         epoch += 1
@@ -444,12 +553,25 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
                     best_ppl = vp
                     best_acc = va
                     mark = " *BEST"
-                    # Save best checkpoint
-                    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', 'results')
-                    os.makedirs(ckpt_dir, exist_ok=True)
-                    safe_name = run_name.replace(' ', '_').lower()
-                    ckpt_path = os.path.join(ckpt_dir, f'{safe_name}.pt')
-                    torch.save(model.state_dict(), ckpt_path)
+                    # Save best weights (lightweight, for inference)
+                    best_path = os.path.join(ckpt_dir, f'{safe_name}.pt')
+                    torch.save(model.state_dict(), best_path)
+                # Save resumable checkpoint (full training state) every eval
+                resume_ckpt_path = os.path.join(ckpt_dir, f'{safe_name}_resume.pt')
+                torch.save({
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scaler': scaler.state_dict(),
+                    'scheduler_step': scheduler.step_count,
+                    'step': step,
+                    'epoch': epoch,
+                    'tokens_seen': tokens_seen,
+                    'best_val_loss': best_val_loss,
+                    'best_ppl': best_ppl,
+                    'best_acc': best_acc,
+                    'curve': curve,
+                    'seed': seed,
+                }, resume_ckpt_path)
                 print(f"    Step {step:>5}/{total_steps} | "
                       f"Tokens {tokens_seen/1e6:.1f}M | "
                       f"Val PPL {vp:>7.1f} Acc {va:>5.1f}% | "
@@ -462,6 +584,17 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
                     'acc': round(va, 2),
                     'time_s': round(elapsed, 1),
                 })
+                # wandb logging
+                if wb_run:
+                    wandb.log({
+                        'val/ppl': vp,
+                        'val/acc': va,
+                        'val/loss': vl,
+                        'train/tokens_M': tokens_seen / 1e6,
+                        'train/tok_per_sec': tps,
+                        'train/lr': optimizer.param_groups[0]['lr'],
+                        'step': step,
+                    })
 
     total_time = time.time() - t0
     final_tps = tokens_seen / total_time
@@ -472,6 +605,12 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
             monitor.save_report()
         except Exception as e:
             print(f"    [Monitor] save_report failed: {e}")
+
+    # Close wandb run
+    if wb_run:
+        wandb.log({'final/best_ppl': best_ppl, 'final/best_acc': best_acc,
+                   'final/tokens_per_sec': round(final_tps)})
+        wandb.finish()
 
     return {
         'run_name': run_name,
@@ -485,6 +624,7 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
         'tokens_per_sec': round(final_tps),
         'epochs': epoch,
         'curve': curve,
+        'seed': seed,
     }
 
 
@@ -518,14 +658,20 @@ def main():
     print("  Testing O(n log n) efficiency advantage at scale")
     print("=" * 72)
 
+    # Reproducibility
+    seed = int(os.environ.get('SEED', '42'))
+    set_seed(seed)
+    print(f"\n  Seed: {seed}")
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = device.type == 'cuda'
-    print(f"\n  Device: {device}")
+    print(f"  Device: {device}")
     if device.type == 'cuda':
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"  GPU: {gpu_name}")
         print(f"  VRAM: {vram_gb:.1f} GB")
+    print(f"  wandb: {'enabled' if _wandb_available else 'disabled'}")
 
     # Parse scale filter from environment
     scale_filter = os.environ.get('SCALE', '').strip()
@@ -539,20 +685,33 @@ def main():
     run_wave = model_filter in ('', 'wave', 'both')
     run_std = model_filter in ('', 'standard', 'std', 'both')
 
+    # Resume support: RESUME=1 to auto-detect, RESUME=path for explicit
+    resume_env = os.environ.get('RESUME', '').strip()
+    resume_enabled = resume_env not in ('', '0', 'false')
+
+    results_dir = os.path.join(os.path.dirname(__file__), '..', 'results')
+    os.makedirs(results_dir, exist_ok=True)
+
     print(f"\n  Scales: {scale_keys}")
     print(f"  Models: {'SPECTRE-Wave' if run_wave else ''} {'Standard' if run_std else ''}")
+    if resume_enabled:
+        print(f"  Resume: enabled")
 
     # Load data + tokenizer
     splits, dataset_name = load_wikitext()
+    cache_dir = os.path.join(os.path.dirname(__file__), '..', 'results', 'cache')
     print(f"\n  Training BPE tokenizer (8K vocab)...")
-    raw_tok = train_bpe_tokenizer(splits['train'], vocab_size=8000)
+    raw_tok = train_bpe_tokenizer(splits['train'], vocab_size=8000, cache_dir=cache_dir)
     tok = BPEWrapper(raw_tok)
     vocab_size = tok.vocab_size_actual()
     print(f"  Vocab: {vocab_size}")
 
     print(f"  Tokenizing corpus...")
-    train_ids = tokenize_corpus(splits['train'], tok)
-    val_ids = tokenize_corpus(splits['valid'], tok)
+    ds_tag = 'wt103' if 'WikiText-103' in dataset_name else 'wt2'
+    train_ids = tokenize_corpus(splits['train'], tok,
+                                cache_path=os.path.join(cache_dir, f'{ds_tag}_train.npy'))
+    val_ids = tokenize_corpus(splits['valid'], tok,
+                              cache_path=os.path.join(cache_dir, f'{ds_tag}_val.npy'))
     print(f"  Train: {len(train_ids):,} tokens | Val: {len(val_ids):,} tokens")
 
     all_results = []
@@ -565,6 +724,7 @@ def main():
         'gpu': gpu_name if device.type == 'cuda' else 'cpu',
         'vram_gb': round(vram_gb, 1) if device.type == 'cuda' else 0,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'seed': seed,
     }
 
     for scale_key in scale_keys:
@@ -601,11 +761,23 @@ def main():
                 params = count_params(model)
                 print(f"\n  SPECTRE-Wave params: {params:,}")
 
+                # Check for resumable checkpoint
+                wave_resume = None
+                if resume_enabled:
+                    wave_safe = f"spectre-wave_{scale_key.lower()}_resume.pt"
+                    wave_resume_path = os.path.join(results_dir, wave_safe)
+                    if os.path.exists(wave_resume_path):
+                        wave_resume = wave_resume_path
+                    elif resume_env not in ('1', 'true') and os.path.exists(resume_env):
+                        wave_resume = resume_env
+
                 result = train_run(
                     model, train_data, val_data, vocab_size, device,
                     f"SPECTRE-Wave {scale_key}",
                     cfg['token_budget'], seq_len, batch_size,
                     cfg['peak_lr'], use_amp,
+                    scale_key=scale_key, model_type='wave', seed=seed,
+                    resume_path=wave_resume,
                 )
                 result['scale'] = scale_key
                 result['model_type'] = 'wave'
@@ -646,11 +818,21 @@ def main():
                 params = count_params(model)
                 print(f"\n  Standard Transformer params: {params:,}")
 
+                # Check for resumable checkpoint
+                std_resume = None
+                if resume_enabled:
+                    std_safe = f"standard_{scale_key.lower()}_resume.pt"
+                    std_resume_path = os.path.join(results_dir, std_safe)
+                    if os.path.exists(std_resume_path):
+                        std_resume = std_resume_path
+
                 result = train_run(
                     model, train_data, val_data, vocab_size, device,
                     f"Standard {scale_key}",
                     cfg['token_budget'], seq_len, batch_size,
                     cfg['peak_lr'], use_amp,
+                    scale_key=scale_key, model_type='standard', seed=seed,
+                    resume_path=std_resume,
                 )
                 result['scale'] = scale_key
                 result['model_type'] = 'standard'
@@ -749,8 +931,6 @@ def main():
     print(f"  V4.3 @ 5M tok (8.6M params): SPECTRE PPL 117.6, Standard PPL 457.2 (3.9x)")
 
     # Save results
-    results_dir = os.path.join(os.path.dirname(__file__), '..', 'results')
-    os.makedirs(results_dir, exist_ok=True)
     output = {
         'metadata': run_metadata,
         'results': all_results,
