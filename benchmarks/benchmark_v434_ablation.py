@@ -168,12 +168,30 @@ def main():
     train_data = make_chunks(train_ids, cfg['seq_len'])
     val_data = make_chunks(val_ids, cfg['seq_len'])
 
-    all_results = []
     results_dir = os.path.join(os.path.dirname(__file__), '..', 'results')
     os.makedirs(results_dir, exist_ok=True)
 
+    # --- Resume support: load partial results from previous crash ---
+    partial_path = os.path.join(results_dir, 'v434_ablation_partial.json')
+    if os.path.exists(partial_path):
+        with open(partial_path) as f:
+            partial = json.load(f)
+        all_results = partial.get('results', [])
+        done = set(partial.get('completed_variants', []))
+        print(f"\n  Resuming from partial results: {len(done)} variants already done")
+        for r in all_results:
+            name = r.get('ablation_name', r.get('run_name', '?'))
+            ppl = r.get('best_ppl', 'err')
+            print(f"    {name}: PPL={ppl}")
+    else:
+        all_results = []
+        done = set()
+
     # --- Run each ablation ---
     for key, abl_cfg in ABLATIONS.items():
+        if key in done:
+            print(f"\n  SKIP (already done): {abl_cfg['name']}")
+            continue
         print(f"\n{'='*72}")
         print(f"  ABLATION: {abl_cfg['name']}")
         print(f"  {abl_cfg['desc']}")
@@ -216,42 +234,80 @@ def main():
                 torch.cuda.empty_cache()
             gc.collect()
 
+        # Save intermediate results after each variant (crash recovery)
+        intermediate = {
+            'metadata': {
+                'benchmark': 'v434_ablation',
+                'dataset': dataset_name,
+                'vocab_size': vocab_size,
+                'scale': 'S1',
+                'seed': seed,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            },
+            'results': all_results,
+            'status': 'in_progress',
+            'completed_variants': [r.get('ablation') for r in all_results if r.get('ablation')],
+        }
+        with open(partial_path, 'w') as f:
+            json.dump(intermediate, f, indent=2)
+        print(f"  Intermediate results saved ({len(all_results)} variants done)")
+
     # --- Standard Transformer reference ---
-    print(f"\n{'='*72}")
-    print(f"  REFERENCE: Standard Transformer")
-    print(f"{'='*72}")
+    if 'F_standard' in done:
+        print(f"\n  SKIP (already done): Standard Transformer")
+    else:
+        print(f"\n{'='*72}")
+        print(f"  REFERENCE: Standard Transformer")
+        print(f"{'='*72}")
 
-    try:
-        model = StandardTransformer(
-            vocab_size=vocab_size,
-            embedding_dim=cfg['embedding_dim'],
-            num_layers=cfg['num_layers'],
-            num_heads=cfg['num_heads'],
-            ffn_dim=cfg['ffn_dim'],
-            max_seq_len=cfg['seq_len'] + 2,
-            dropout=0.1,
-        ).to(device)
-        params = count_params(model)
-        print(f"  Params: {params:,}")
+        try:
+            model = StandardTransformer(
+                vocab_size=vocab_size,
+                embedding_dim=cfg['embedding_dim'],
+                num_layers=cfg['num_layers'],
+                num_heads=cfg['num_heads'],
+                ffn_dim=cfg['ffn_dim'],
+                max_seq_len=cfg['seq_len'] + 2,
+                dropout=0.1,
+            ).to(device)
+            params = count_params(model)
+            print(f"  Params: {params:,}")
 
-        result = train_run(
-            model, train_data, val_data, vocab_size, device,
-            "Standard Transformer",
-            cfg['token_budget'], cfg['seq_len'], cfg['batch_size'],
-            cfg['peak_lr'], use_amp,
-            scale_key='S1', model_type='standard', seed=seed,
-        )
-        result['ablation'] = 'F_standard'
-        result['ablation_name'] = 'Standard Transformer'
-        all_results.append(result)
-    except RuntimeError as e:
-        print(f"  ERROR: {e}")
-    finally:
-        if 'model' in dir():
-            del model
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-        gc.collect()
+            result = train_run(
+                model, train_data, val_data, vocab_size, device,
+                "Standard Transformer",
+                cfg['token_budget'], cfg['seq_len'], cfg['batch_size'],
+                cfg['peak_lr'], use_amp,
+                scale_key='S1', model_type='standard', seed=seed,
+            )
+            result['ablation'] = 'F_standard'
+            result['ablation_name'] = 'Standard Transformer'
+            all_results.append(result)
+        except RuntimeError as e:
+            print(f"  ERROR: {e}")
+        finally:
+            if 'model' in dir():
+                del model
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            gc.collect()
+
+        # Save after Standard Transformer too
+        intermediate = {
+            'metadata': {
+                'benchmark': 'v434_ablation',
+                'dataset': dataset_name,
+                'vocab_size': vocab_size,
+                'scale': 'S1',
+                'seed': seed,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            },
+            'results': all_results,
+            'status': 'in_progress',
+            'completed_variants': [r.get('ablation') for r in all_results if r.get('ablation')],
+        }
+        with open(partial_path, 'w') as f:
+            json.dump(intermediate, f, indent=2)
 
     # ============================================================
     # RESULTS TABLE
@@ -314,6 +370,11 @@ def main():
     with open(results_path, 'w') as f:
         json.dump(output, f, indent=2)
     print(f"\n  Results saved: {results_path}")
+
+    # Clean up partial file now that final results are saved
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
+        print(f"  Cleaned up partial results file")
 
 
 if __name__ == '__main__':

@@ -23,10 +23,11 @@ checkpoints/
 # Logs
 *.log
 
-# Notebooks (keep only the colab notebook)
+# Notebooks (keep colab notebooks)
 .ipynb_checkpoints/
 *.ipynb
 !wave_llm_colab.ipynb
+!notebooks/*.ipynb
 
 # Text files (keep requirements)
 *.txt
