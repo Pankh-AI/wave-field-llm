@@ -21,6 +21,11 @@ Usage:
   python benchmarks/benchmark_v434_ablation.py
   SEED=42 python benchmarks/benchmark_v434_ablation.py
   WANDB=0 python benchmarks/benchmark_v434_ablation.py
+
+Parallel mode (run subset of variants in separate processes):
+  VARIANTS=A_v433_baseline,B_normalized_exp_only python benchmarks/benchmark_v434_ablation.py
+  VARIANTS=C_gate_10x_only,D_kernel_reach_only python benchmarks/benchmark_v434_ablation.py
+  VARIANTS=E_v434_full,F_standard python benchmarks/benchmark_v434_ablation.py
 """
 
 import os
@@ -141,10 +146,15 @@ def main():
     seed = int(os.environ.get('SEED', '42'))
     set_seed(seed)
 
+    # Parallel mode: VARIANTS env var selects a subset of variants to run
+    variant_filter = [v.strip() for v in os.environ.get('VARIANTS', '').split(',') if v.strip()] or None
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = device.type == 'cuda'
     print(f"\n  Device: {device}")
     print(f"  Seed: {seed}")
+    if variant_filter:
+        print(f"  Variants: {variant_filter}")
     if device.type == 'cuda':
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -173,22 +183,42 @@ def main():
 
     # --- Resume support: load partial results from previous crash ---
     partial_path = os.path.join(results_dir, 'v434_ablation_partial.json')
+    all_results = []
+    done = set()
+
+    # Check per-variant result files (from parallel runs)
+    for check_key in list(ABLATIONS.keys()) + ['F_standard']:
+        vpath = os.path.join(results_dir, f'v434_ablation_{check_key}.json')
+        if os.path.exists(vpath):
+            try:
+                with open(vpath) as f:
+                    vdata = json.load(f)
+                all_results.append(vdata)
+                done.add(check_key)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    # Also check legacy partial JSON (from sequential runs)
     if os.path.exists(partial_path):
         with open(partial_path) as f:
             partial = json.load(f)
-        all_results = partial.get('results', [])
-        done = set(partial.get('completed_variants', []))
-        print(f"\n  Resuming from partial results: {len(done)} variants already done")
+        for r in partial.get('results', []):
+            abl = r.get('ablation')
+            if abl and abl not in done:
+                all_results.append(r)
+                done.add(abl)
+
+    if done:
+        print(f"\n  Resuming: {len(done)} variants already done")
         for r in all_results:
             name = r.get('ablation_name', r.get('run_name', '?'))
             ppl = r.get('best_ppl', 'err')
             print(f"    {name}: PPL={ppl}")
-    else:
-        all_results = []
-        done = set()
 
     # --- Run each ablation ---
     for key, abl_cfg in ABLATIONS.items():
+        if variant_filter and key not in variant_filter:
+            continue
         if key in done:
             print(f"\n  SKIP (already done): {abl_cfg['name']}")
             continue
@@ -234,27 +264,37 @@ def main():
                 torch.cuda.empty_cache()
             gc.collect()
 
-        # Save intermediate results after each variant (crash recovery)
-        intermediate = {
-            'metadata': {
-                'benchmark': 'v434_ablation',
-                'dataset': dataset_name,
-                'vocab_size': vocab_size,
-                'scale': 'S1',
-                'seed': seed,
-                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-            },
-            'results': all_results,
-            'status': 'in_progress',
-            'completed_variants': [r.get('ablation') for r in all_results if r.get('ablation')],
-        }
-        with open(partial_path, 'w') as f:
-            json.dump(intermediate, f, indent=2)
-        print(f"  Intermediate results saved ({len(all_results)} variants done)")
+        # Save per-variant result file (parallel-safe, no race conditions)
+        last_result = all_results[-1] if all_results else None
+        if last_result and 'error' not in last_result:
+            variant_path = os.path.join(results_dir, f'v434_ablation_{key}.json')
+            with open(variant_path, 'w') as f:
+                json.dump(last_result, f, indent=2)
+
+        # Save intermediate results (crash recovery for sequential mode)
+        if not variant_filter:
+            intermediate = {
+                'metadata': {
+                    'benchmark': 'v434_ablation',
+                    'dataset': dataset_name,
+                    'vocab_size': vocab_size,
+                    'scale': 'S1',
+                    'seed': seed,
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                },
+                'results': all_results,
+                'status': 'in_progress',
+                'completed_variants': [r.get('ablation') for r in all_results if r.get('ablation')],
+            }
+            with open(partial_path, 'w') as f:
+                json.dump(intermediate, f, indent=2)
+        print(f"  Results saved ({len(all_results)} variants done)")
 
     # --- Standard Transformer reference ---
-    if 'F_standard' in done:
-        print(f"\n  SKIP (already done): Standard Transformer")
+    skip_standard = 'F_standard' in done or (variant_filter and 'F_standard' not in variant_filter)
+    if skip_standard:
+        if 'F_standard' in done:
+            print(f"\n  SKIP (already done): Standard Transformer")
     else:
         print(f"\n{'='*72}")
         print(f"  REFERENCE: Standard Transformer")
@@ -283,6 +323,11 @@ def main():
             result['ablation'] = 'F_standard'
             result['ablation_name'] = 'Standard Transformer'
             all_results.append(result)
+
+            # Save per-variant result
+            variant_path = os.path.join(results_dir, 'v434_ablation_F_standard.json')
+            with open(variant_path, 'w') as f:
+                json.dump(result, f, indent=2)
         except RuntimeError as e:
             print(f"  ERROR: {e}")
         finally:
@@ -292,22 +337,23 @@ def main():
                 torch.cuda.empty_cache()
             gc.collect()
 
-        # Save after Standard Transformer too
-        intermediate = {
-            'metadata': {
-                'benchmark': 'v434_ablation',
-                'dataset': dataset_name,
-                'vocab_size': vocab_size,
-                'scale': 'S1',
-                'seed': seed,
-                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-            },
-            'results': all_results,
-            'status': 'in_progress',
-            'completed_variants': [r.get('ablation') for r in all_results if r.get('ablation')],
-        }
-        with open(partial_path, 'w') as f:
-            json.dump(intermediate, f, indent=2)
+        # Save intermediate (sequential mode only)
+        if not variant_filter:
+            intermediate = {
+                'metadata': {
+                    'benchmark': 'v434_ablation',
+                    'dataset': dataset_name,
+                    'vocab_size': vocab_size,
+                    'scale': 'S1',
+                    'seed': seed,
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                },
+                'results': all_results,
+                'status': 'in_progress',
+                'completed_variants': [r.get('ablation') for r in all_results if r.get('ablation')],
+            }
+            with open(partial_path, 'w') as f:
+                json.dump(intermediate, f, indent=2)
 
     # ============================================================
     # RESULTS TABLE
@@ -355,26 +401,29 @@ def main():
             print(f"  {name:<30} {ppl:>8.1f} {gap:>7.2f}x {delta}")
 
     # Save results
-    output = {
-        'metadata': {
-            'benchmark': 'v434_ablation',
-            'dataset': dataset_name,
-            'vocab_size': vocab_size,
-            'scale': 'S1',
-            'seed': seed,
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        },
-        'results': all_results,
-    }
-    results_path = os.path.join(results_dir, 'v434_ablation.json')
-    with open(results_path, 'w') as f:
-        json.dump(output, f, indent=2)
-    print(f"\n  Results saved: {results_path}")
+    if variant_filter:
+        print(f"\n  Subset complete ({len(all_results)} variants). Per-variant files saved.")
+    else:
+        output = {
+            'metadata': {
+                'benchmark': 'v434_ablation',
+                'dataset': dataset_name,
+                'vocab_size': vocab_size,
+                'scale': 'S1',
+                'seed': seed,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            },
+            'results': all_results,
+        }
+        results_path = os.path.join(results_dir, 'v434_ablation.json')
+        with open(results_path, 'w') as f:
+            json.dump(output, f, indent=2)
+        print(f"\n  Results saved: {results_path}")
 
-    # Clean up partial file now that final results are saved
-    if os.path.exists(partial_path):
-        os.remove(partial_path)
-        print(f"  Cleaned up partial results file")
+        # Clean up partial file now that final results are saved
+        if os.path.exists(partial_path):
+            os.remove(partial_path)
+            print(f"  Cleaned up partial results file")
 
 
 if __name__ == '__main__':
