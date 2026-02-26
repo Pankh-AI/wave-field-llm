@@ -465,6 +465,62 @@ def test_stateful_leak(device):
     return passed
 
 
+def test_full_size_configs(device):
+    """Test 9: Realistic S1/S2 model configs (not just tiny 2-layer model).
+
+    The tiny test model (embed=64, 2 layers) can miss leaks that only appear
+    at scale due to FFT padding ratios. This test uses the actual S1/S2
+    configs with field_size=seq_len to catch circular wraparound leaks.
+    """
+    print("\n  TEST 9: Full-size model configs (S1/S2)")
+    print("  " + "-" * 55)
+
+    configs = {
+        'S1': dict(vocab_size=8000, embedding_dim=384, num_layers=8,
+                   num_heads=8, ffn_dim=1536, field_size=512, max_seq_len=514),
+        'S2': dict(vocab_size=8000, embedding_dim=512, num_layers=12,
+                   num_heads=8, ffn_dim=2048, field_size=512, max_seq_len=514),
+    }
+
+    all_pass = True
+
+    for name, cfg in configs.items():
+        model = WaveFieldTransformer(
+            dropout=0.0, use_checkpoint=False,
+            interference_interval=3, device=device, **cfg,
+        ).to(device).eval()
+
+        params = sum(p.numel() for p in model.parameters())
+        print(f"  {name} ({params/1e6:.1f}M params):")
+
+        # Test at N=512 (the actual training seq_len). Smaller N values
+        # have fractional stride positions that create harmless interpolation
+        # noise unrelated to causality.
+        seq_len = 512
+        max_leak = 0.0
+        for trial in range(3):
+            a = torch.randint(0, cfg['vocab_size'], (1, seq_len), device=device)
+            b = a.clone()
+            b[0, -1] = (a[0, -1] + 50) % cfg['vocab_size']
+
+            with torch.no_grad():
+                la, _ = model(a)
+                lb, _ = model(b)
+
+            leak = max((la[0, p] - lb[0, p]).abs().max().item()
+                       for p in range(seq_len - 1))
+            max_leak = max(max_leak, leak)
+
+        status = "OK" if max_leak < STRICT_THRESHOLD else "LEAK!"
+        if max_leak >= STRICT_THRESHOLD:
+            all_pass = False
+        print(f"    N={seq_len} (3 trials): max_leak = {max_leak:.8f}  {status}")
+
+        del model
+
+    return all_pass
+
+
 def main():
     print("=" * 65)
     print("  CAUSALITY TEST SUITE")
@@ -484,6 +540,7 @@ def main():
     results['batch_isolation'] = test_batch_isolation(device)
     results['global_context'] = test_global_context_causality(device)
     results['stateful'] = test_stateful_leak(device)
+    results['full_size'] = test_full_size_configs(device)
 
     # Summary
     print("\n" + "=" * 65)
