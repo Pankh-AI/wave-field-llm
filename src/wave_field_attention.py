@@ -108,15 +108,18 @@ class LearnedFeatureMap(nn.Module):
 class SpectralGate(nn.Module):
     """Content-adaptive spectral gate (SPECTRE, arXiv:2502.18394).
 
-    A small MLP conditioned on the mean query vector modulates the base wave
+    A small MLP conditioned on the first query token modulates the base wave
     kernel in frequency domain. This makes the effective attention pattern
     input-dependent while staying O(n log n).
 
     Architecture:
-      q_bar = LayerNorm(mean(q, dim=seq))    # (B, H, head_dim)
+      q_bar = LayerNorm(q[:, :, 0, :])       # (B, H, head_dim) — token 0 only
       ctrl = MLP(flatten(q_bar))             # (B, H, n_control)
       gate = interpolate(ctrl, freq_bins)    # (B, H, freq_bins) — smooth
       modulated = base_fft * (1 + gate)      # content-adaptive kernel
+
+    CAUSALITY NOTE: Must NOT use mean(Q) over all positions — that leaks future
+    tokens into the kernel shape. Token 0 is visible to all positions, so safe.
 
     At init, MLP output ≈ 0, so modulated ≈ base kernel (safe start).
     """
@@ -150,10 +153,13 @@ class SpectralGate(nn.Module):
         """
         B, H, N, d = q.shape
 
-        # V4.3.4: mean(Q) over all positions (matches SPECTRE paper). Was token-0
-        # only — too weak signal (1/512 of info). Causal safety: _enforce_causal_kernel
-        # projects the modulated kernel back to causal space via ifft→zero→fft.
-        q_bar = self.norm(q.mean(dim=2))           # (B, H, d)
+        # V4.3.4 FIX: Use first token only (position 0). mean(Q) over all positions
+        # LEAKS FUTURE — kernel shape depends on future Q vectors, giving ~6 logit
+        # difference when changing last token. _enforce_causal_kernel only makes the
+        # impulse response causal, NOT the kernel construction. With FFT convolution,
+        # one kernel applies to all positions, so it can only depend on tokens all
+        # positions can see = token 0.
+        q_bar = self.norm(q[:, :, 0, :])           # (B, H, d)
         q_flat = q_bar.reshape(B, H * d)          # (B, H*d)
 
         # MLP → spectral control points
