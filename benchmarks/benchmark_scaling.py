@@ -59,16 +59,20 @@ if os.environ.get('WANDB', '1') != '0':
         pass
 
 
-def set_seed(seed: int):
-    """Set all random seeds for reproducibility."""
+def set_seed(seed: int, deterministic: bool = True):
+    """Set all random seeds for reproducibility.
+
+    Args:
+        deterministic: If False, enables cudnn.benchmark for +5-10% speed
+                       at the cost of ±1-2 PPL variance between runs.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    # Deterministic convolutions (may slow down, but reproducible)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.wave_field_transformer import WaveFieldTransformer
@@ -149,11 +153,12 @@ SCALE_CONFIGS = {
         'num_layers': 8,
         'num_heads': 8,
         'ffn_dim': 1536,
-        'field_size': 2048,  # must be power-of-2 for cuFFT half precision
+        'field_size': 512,   # = seq_len: 4x smaller FFT (pad 1024 vs 4096), stride=1.0
         'seq_len': 512,
         'batch_size': 16,
         'token_budget': 20_000_000,
         'peak_lr': 3e-4,
+        'use_checkpoint': True,   # 6GB laptop GPU needs checkpoint with monitor+saves
     },
     'S2': {
         'name': 'S2 (55M / 50M tok)',
@@ -161,11 +166,12 @@ SCALE_CONFIGS = {
         'num_layers': 12,
         'num_heads': 8,
         'ffn_dim': 2048,
-        'field_size': 2048,
+        'field_size': 512,   # = seq_len: 4x smaller FFT, stride=1.0
         'seq_len': 512,
         'batch_size': 12,
         'token_budget': 50_000_000,
         'peak_lr': 2e-4,
+        'use_checkpoint': True,   # needs checkpoint on consumer GPUs
     },
     'S3': {
         'name': 'S3 (100M / 100M tok)',
@@ -173,7 +179,7 @@ SCALE_CONFIGS = {
         'num_layers': 12,
         'num_heads': 12,
         'ffn_dim': 3072,
-        'field_size': 2048,
+        'field_size': 512,   # = seq_len: 4x smaller FFT, stride=1.0
         'seq_len': 512,
         'batch_size': 8,
         'token_budget': 100_000_000,
@@ -185,7 +191,7 @@ SCALE_CONFIGS = {
         'num_layers': 12,
         'num_heads': 16,
         'ffn_dim': 4096,
-        'field_size': 2048,
+        'field_size': 512,   # = seq_len: 4x smaller FFT, stride=1.0
         'seq_len': 512,
         'batch_size': 4,
         'token_budget': 200_000_000,
@@ -360,6 +366,7 @@ def create_batches(data, batch_size, device, shuffle=True):
 
 def create_wave_model(vocab_size, cfg, device):
     """Create SPECTRE-Wave model for a given scale config."""
+    use_ckpt = cfg.get('use_checkpoint', True)
     model = WaveFieldTransformer(
         vocab_size=vocab_size,
         embedding_dim=cfg['embedding_dim'],
@@ -369,7 +376,7 @@ def create_wave_model(vocab_size, cfg, device):
         field_size=cfg['field_size'],
         max_seq_len=cfg['seq_len'] + 2,
         dropout=0.1,
-        use_checkpoint=True,
+        use_checkpoint=use_ckpt,
         interference_interval=3,
         n_components=1,
         local_window=0,
@@ -446,8 +453,8 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
               use_amp=True, scale_key='', model_type='', seed=42,
               resume_path=None):
     """Train a model and return results dict with training curve."""
-    # Per-run seed for reproducibility (ensures different runs start fresh)
-    set_seed(seed)
+    # Per-run seed + non-deterministic cuDNN for speed (+5-10%)
+    set_seed(seed)  # deterministic=True: cudnn.benchmark=False avoids stall on variable batch sizes
 
     params = count_params(model)
     tokens_per_step = batch_size * seq_len

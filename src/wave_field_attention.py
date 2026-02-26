@@ -76,11 +76,13 @@ class ELUPlus1(nn.Module):
 class LearnedFeatureMap(nn.Module):
     """Learned positive feature map for linear attention (Hedgehog, ICLR 2024).
 
-    MLP of `depth` identity-initialized Linear(d,d) + ELU+1 layers.
-    At init: phi(x) = ELU(Ix)+1 — always positive, no dead neurons.
+    MLP of `depth` identity-initialized Linear(d,d) + ReLU layers.
+    At init: phi(x) = ReLU(Ix) + eps — 50% sparse, rank d/2.
     During training: learns spiky, dot-product-monotonic maps that mimic softmax.
 
-    V4.3.2: Replaced ReLU with ELU+1 to fix 35-55% dead neuron problem.
+    V4.3.4: Reverted to ReLU from ELU+1. ELU+1 collapsed effective rank to 2.3
+    because ELU(0)+1=1 maps all outputs ≈ [1,1,...,1]. ReLU's 50% zeroed dims
+    give rank d/2 = 24 >> 2.3. The eps floor ensures positivity for linear attn.
 
     depth=1: original V4.3 (single linear).
     depth=2: Hedgehog-style (closes 68.6% of linear-vs-softmax gap at 125M scale).
@@ -96,7 +98,7 @@ class LearnedFeatureMap(nn.Module):
                 nn.init.eye_(lin.weight)
                 nn.init.zeros_(lin.bias)
             layers.append(lin)
-            layers.append(ELUPlus1())
+            layers.append(nn.ReLU())
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -134,9 +136,10 @@ class SpectralGate(nn.Module):
             nn.Linear(input_dim, num_heads * n_control),
         )
 
-        # Near-zero init: at start, gate ≈ 0 → modulated ≈ base kernel
+        # V4.3.4: 5x larger init (was 0.01). Old scale + weight decay caused
+        # gate to decay to near-zero (range < 0.07 after 20M tokens).
         with torch.no_grad():
-            self.net[-1].weight.mul_(0.01)
+            self.net[-1].weight.mul_(0.05)
             self.net[-1].bias.zero_()
 
     def forward(self, q, base_kernel_fft):
@@ -147,8 +150,10 @@ class SpectralGate(nn.Module):
         """
         B, H, N, d = q.shape
 
-        # Causal query summary: first position only (every position can see pos 0)
-        q_bar = self.norm(q[:, :, 0, :])          # (B, H, d)
+        # V4.3.4: mean(Q) over all positions (matches SPECTRE paper). Was token-0
+        # only — too weak signal (1/512 of info). Causal safety: _enforce_causal_kernel
+        # projects the modulated kernel back to causal space via ifft→zero→fft.
+        q_bar = self.norm(q.mean(dim=2))           # (B, H, d)
         q_flat = q_bar.reshape(B, H * d)          # (B, H*d)
 
         # MLP → spectral control points
@@ -172,6 +177,7 @@ class WaveFieldAttention(nn.Module):
                  use_3d_interference=False,
                  use_kernel_mixture=False, num_basis_kernels=4,
                  layer_idx=0, num_layers=1,
+                 skip_causal_enforce=False,
                  device='cuda'):
         super().__init__()
 
@@ -189,6 +195,7 @@ class WaveFieldAttention(nn.Module):
         self.num_basis_kernels = num_basis_kernels
         self.layer_idx = layer_idx
         self.num_layers = num_layers
+        self.skip_causal_enforce = skip_causal_enforce
         self.device = device
 
         assert embedding_dim % num_heads == 0
@@ -353,10 +360,22 @@ class WaveFieldAttention(nn.Module):
             self.token_pos_proj = nn.Linear(embedding_dim, 3)
 
         # Fixed stride for absolute position mapping
+        stride_val = (field_size - 1) / max(max_seq_len - 1, 1)
         self.register_buffer(
             'field_stride',
-            torch.tensor((field_size - 1) / max(max_seq_len - 1, 1), dtype=torch.float32)
+            torch.tensor(stride_val, dtype=torch.float32)
         )
+
+        # Precompute scatter/gather indices (same every forward pass)
+        seq_pos = torch.arange(max_seq_len, dtype=torch.float32)
+        field_pos = (seq_pos * stride_val).clamp(0, field_size - 2)
+        idx_lo = field_pos.long().clamp(0, field_size - 2)
+        idx_hi = idx_lo + 1
+        frac = (field_pos - idx_lo.float()).clamp(0, 1)
+        self.register_buffer('_cached_field_pos', field_pos)
+        self.register_buffer('_cached_idx_lo', idx_lo)
+        self.register_buffer('_cached_idx_hi', idx_hi)
+        self.register_buffer('_cached_frac', frac)
 
         self.scale = math.sqrt(self.head_dim)
 
@@ -620,7 +639,9 @@ class WaveFieldAttention(nn.Module):
         # Enforce causality: spectral gate modulation can introduce anti-causal
         # components by breaking the Hilbert transform relationship. Project
         # back to causal space before convolving.
-        if kernel_fft.dim() == 3:
+        # Skip when using analytic kernel (causal by construction) + real-valued
+        # spectral gate (preserves causality). Verify with test_causality.py.
+        if kernel_fft.dim() == 3 and not self.skip_causal_enforce:
             kernel_fft = self._enforce_causal_kernel(kernel_fft, G)
 
         # Keep 4D: (B, H, G, D) → (B, D, H, G) — FFT along last dim (G)
@@ -649,14 +670,13 @@ class WaveFieldAttention(nn.Module):
 
         return convolved.permute(0, 2, 3, 1)  # back to (B, H, G, D)
 
-    def _bilinear_scatter(self, values, field_pos_float, B, H, G, head_dim, device):
-        """Deposit values onto field using bilinear interpolation."""
-        N = field_pos_float.shape[0]
+    def _bilinear_scatter(self, values, idx_lo, idx_hi, frac, B, H, G, head_dim, device):
+        """Deposit values onto field using bilinear interpolation.
 
-        idx_lo = field_pos_float.long().clamp(0, G - 2)
-        idx_hi = idx_lo + 1
+        Uses precomputed indices (cached as buffers) to avoid recomputation.
+        """
+        N = idx_lo.shape[0]
 
-        frac = (field_pos_float - idx_lo.float()).clamp(0, 1)
         # Cast weights to match values dtype (AMP produces float16 values but float32 positions)
         w_lo = (1.0 - frac).to(values.dtype).view(1, 1, N, 1)
         w_hi = frac.to(values.dtype).view(1, 1, N, 1)
@@ -671,15 +691,14 @@ class WaveFieldAttention(nn.Module):
 
         return field
 
-    def _bilinear_gather(self, field, field_pos_float):
-        """Read from field using bilinear interpolation."""
+    def _bilinear_gather(self, field, idx_lo, idx_hi, frac):
+        """Read from field using bilinear interpolation.
+
+        Uses precomputed indices (cached as buffers) to avoid recomputation.
+        """
         B, H, G, D = field.shape
-        N = field_pos_float.shape[0]
+        N = idx_lo.shape[0]
 
-        idx_lo = field_pos_float.long().clamp(0, G - 2)
-        idx_hi = idx_lo + 1
-
-        frac = (field_pos_float - idx_lo.float()).clamp(0, 1)
         # Cast weights to match field dtype (AMP produces float16 field but float32 positions)
         w_lo = (1.0 - frac).to(field.dtype).view(1, 1, N, 1)
         w_hi = frac.to(field.dtype).view(1, 1, N, 1)
@@ -697,7 +716,7 @@ class WaveFieldAttention(nn.Module):
         coupling = F.softmax(self.field_coupling, dim=-1)
         return torch.einsum('ij,bjgd->bigd', coupling, field)
 
-    def _kernel_mixture_forward(self, field, q, field_pos_float, x):
+    def _kernel_mixture_forward(self, field, q, idx_lo, idx_hi, frac, x):
         """Content-Adaptive Kernel Mixture: K basis convolutions, per-token mixing.
 
         Each query token selects its own weighted mixture of K convolved fields.
@@ -705,7 +724,7 @@ class WaveFieldAttention(nn.Module):
 
         field: (B, H, G, D) — scattered deposit
         q: (B, H, N, head_dim) — raw queries (pre-feature-map)
-        field_pos_float: (N,) — field positions for gather
+        idx_lo, idx_hi, frac: precomputed scatter/gather indices
         x: (B, N, D) — original input (for 3D interference if enabled)
         Returns: (B, H, N, D) — gathered output
         """
@@ -746,7 +765,7 @@ class WaveFieldAttention(nn.Module):
                 field_m = self._apply_field_coupling(field_m)
 
             # Gather at token positions
-            gathered_m = self._bilinear_gather(field_m, field_pos_float)  # (B, H, N, D)
+            gathered_m = self._bilinear_gather(field_m, idx_lo, idx_hi, frac)  # (B, H, N, D)
 
             # Weight by per-token alpha and accumulate
             output = output + alpha[:, :, :, m:m+1] * gathered_m
@@ -860,9 +879,18 @@ class WaveFieldAttention(nn.Module):
         v = v.view(B, N, H, head_dim).transpose(1, 2)
 
         # ================= WAVE FIELD PATH (linear-wave attention) =================
-        # ABSOLUTE POSITION MAPPING
-        seq_pos = torch.arange(N, device=x.device, dtype=torch.float32)
-        field_pos_float = (seq_pos * self.field_stride).clamp(0, G - 2)
+        # ABSOLUTE POSITION MAPPING — use precomputed indices (slice to actual N)
+        if N <= self._cached_idx_lo.shape[0]:
+            idx_lo = self._cached_idx_lo[:N]
+            idx_hi = self._cached_idx_hi[:N]
+            frac = self._cached_frac[:N]
+        else:
+            # N exceeds max_seq_len — recompute on the fly (rare, e.g. tests)
+            seq_pos = torch.arange(N, device=x.device, dtype=torch.float32)
+            field_pos_float = (seq_pos * self.field_stride).clamp(0, G - 2)
+            idx_lo = field_pos_float.long().clamp(0, G - 2)
+            idx_hi = idx_lo + 1
+            frac = (field_pos_float - idx_lo.float()).clamp(0, 1)
 
         # V4.3: LEARNED FEATURE MAPS (Hedgehog-style)
         # At init (identity weights): φ(x) = ReLU(x) + eps — tokens are distinct
@@ -880,11 +908,11 @@ class WaveFieldAttention(nn.Module):
             deposit = deposit * write_strength
 
         # SCATTER → CONVOLVE → COUPLE → GATHER
-        field = self._bilinear_scatter(deposit, field_pos_float, B, H, G, head_dim, x.device)
+        field = self._bilinear_scatter(deposit, idx_lo, idx_hi, frac, B, H, G, head_dim, x.device)
 
         if self.use_kernel_mixture:
             # Content-Adaptive Kernel Mixture: K basis convolutions, per-token mixing
-            gathered = self._kernel_mixture_forward(field, q, field_pos_float, x)
+            gathered = self._kernel_mixture_forward(field, q, idx_lo, idx_hi, frac, x)
         else:
             # V4.3 path: single kernel with SpectralGate modulation
             if self.use_analytic_kernel and self.n_components == 1:
@@ -900,7 +928,7 @@ class WaveFieldAttention(nn.Module):
             else:
                 field = self._apply_field_coupling(field)
 
-            gathered = self._bilinear_gather(field, field_pos_float)  # (B, H, N, head_dim)
+            gathered = self._bilinear_gather(field, idx_lo, idx_hi, frac)  # (B, H, N, head_dim)
 
         # Q-WEIGHTED READING: Q selects which dimensions to use
         wave_output = q_feat * gathered  # (B, H, N, head_dim)

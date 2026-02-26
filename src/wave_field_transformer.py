@@ -75,6 +75,7 @@ class WaveFieldTransformerLayer(nn.Module):
                  use_3d_interference=False,
                  use_kernel_mixture=False, num_basis_kernels=4,
                  layer_idx=0, num_layers=1,
+                 skip_causal_enforce=False,
                  device='cuda'):
         super().__init__()
 
@@ -93,6 +94,7 @@ class WaveFieldTransformerLayer(nn.Module):
             num_basis_kernels=num_basis_kernels,
             layer_idx=layer_idx,
             num_layers=num_layers,
+            skip_causal_enforce=skip_causal_enforce,
             device=device
         )
         
@@ -231,7 +233,8 @@ class WaveFieldTransformer(nn.Module):
                  use_write_gate=True,
                  use_3d_interference=False,
                  use_kernel_mixture=False,
-                 num_basis_kernels=4):
+                 num_basis_kernels=4,
+                 skip_causal_enforce=False):
         super().__init__()
 
         self.vocab_size = vocab_size
@@ -271,6 +274,7 @@ class WaveFieldTransformer(nn.Module):
                 num_basis_kernels=num_basis_kernels,
                 layer_idx=layer_idx,
                 num_layers=num_layers,
+                skip_causal_enforce=skip_causal_enforce,
                 device=self.device
             )
             for layer_idx in range(num_layers)
@@ -329,9 +333,11 @@ class WaveFieldTransformer(nn.Module):
                             nn.init.eye_(module.weight)
                             nn.init.zeros_(module.bias)
 
-                # Spectral gate: restore near-zero output init (skip if kernel mixture)
+                # Spectral gate: restore small-but-meaningful init (skip if kernel mixture)
+                # V4.3.4: 20x larger (was 0.001). Combined with 50x LR + no weight decay,
+                # ensures gate can actually learn spectral modulation.
                 if attn.spectral_gate is not None:
-                    nn.init.normal_(attn.spectral_gate.net[-1].weight, 0, 0.001)
+                    nn.init.normal_(attn.spectral_gate.net[-1].weight, 0, 0.02)
                     nn.init.zeros_(attn.spectral_gate.net[-1].bias)
 
                 # Kernel mixture: restore zero init for projection, warm bias for basis 1
@@ -362,11 +368,12 @@ class WaveFieldTransformer(nn.Module):
                             qk_lr_mult=3.0, kernel_lr_mult=50.0):
         """Create AdamW with per-group learning rates.
 
-        Three param groups (V4.3.2):
+        Four param groups (V4.3.4):
         1. Other params: base_lr (default)
         2. QKV projections: base_lr × 3 (V4.2 ablation: -21% PPL)
-        3. Kernel physics params: base_lr × 50, weight_decay=0
-           (S4/Mamba practice — monitor showed 27-80x gradient deficit)
+        3. Kernel physics params + SpectralGate: base_lr × 50, weight_decay=0
+           V4.3.4: SpectralGate moved here from group 1. At base_lr + wd=0.01,
+           the gate decayed faster than it learned (range < 0.07 after 20M tokens).
         """
         kernel_names = {'wave_frequency', 'wave_damping', 'wave_phase'}
         kernel_params = []
@@ -381,6 +388,8 @@ class WaveFieldTransformer(nn.Module):
                 kernel_params.append(param)
             elif 'qkvg_proj' in name:
                 qk_params.append(param)
+            elif 'spectral_gate' in name:
+                kernel_params.append(param)
             else:
                 other_params.append(param)
 
