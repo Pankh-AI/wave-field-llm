@@ -27,8 +27,8 @@ Usage:
   WANDB=0 python benchmarks/benchmark_scaling.py    # disable wandb logging
   RESUME=1 python benchmarks/benchmark_scaling.py   # auto-resume from checkpoint
 
-Data: WikiText-103 (103M tokens) — auto-downloads via HuggingFace datasets.
-      WikiText-2 used as fallback if WikiText-103 fails.
+Data: WikiText-103 (default, 103M tokens), WikiText-2, or OpenWebText.
+      Set DATASET=103 (default), DATASET=2, or DATASET=owt via env var.
 
 References:
   - SPECTRE (arXiv:2502.18394): content-adaptive spectral gating
@@ -240,13 +240,41 @@ class BPEWrapper:
 
 
 # ======================================================================
-# DATA — WikiText-103 (with WikiText-2 fallback)
+# DATA — WikiText-103 (default), WikiText-2, or OpenWebText
 # ======================================================================
 
-def load_wikitext():
-    """Load WikiText. Use DATASET env var to choose: '103' or '2' (default: '2')."""
+def load_dataset_splits():
+    """Load dataset. Use DATASET env var: '103' (default), '2', or 'owt'.
+
+    WikiText-103: 103M tokens — enough for S1-S3 without repetition.
+    WikiText-2:   2.6M tokens — only good for quick tests (S1 needs 8 epochs).
+    OpenWebText:  ~8B tokens — subset loaded for S3/S4 scale.
+    """
     from datasets import load_dataset
-    choice = os.environ.get('DATASET', '2').strip()
+    choice = os.environ.get('DATASET', '103').strip().lower()
+
+    if choice == 'owt' or choice == 'openwebtext':
+        # OpenWebText: load a subset (100K docs ≈ 50-100M tokens)
+        owt_size = os.environ.get('OWT_SIZE', '100000').strip()
+        try:
+            print(f"  Loading OpenWebText (first {owt_size} docs)...")
+            ds = load_dataset("openwebtext", split=f"train[:{owt_size}]")
+            train_lines = [item['text'].strip() for item in ds
+                           if item['text'].strip()]
+            # Use WikiText-2 for validation (OWT has no val split)
+            val_ds = load_dataset("wikitext", "wikitext-2-raw-v1")
+            val_lines = [item['text'].strip() for item in val_ds['validation']
+                         if item['text'].strip() and not item['text'].strip().startswith('=')]
+            test_lines = [item['text'].strip() for item in val_ds['test']
+                          if item['text'].strip() and not item['text'].strip().startswith('=')]
+            splits = {'train': train_lines, 'valid': val_lines, 'test': test_lines}
+            dataset_name = f"OpenWebText-{owt_size}"
+            print(f"  Dataset: {dataset_name} — {len(splits['train']):,} train docs")
+            return splits, dataset_name
+        except Exception as e:
+            print(f"  OpenWebText failed ({e}), falling back to WikiText-103...")
+            choice = '103'
+
     if choice == '103':
         try:
             print("  Loading WikiText-103 (103M tokens)...")
@@ -271,16 +299,29 @@ def load_wikitext():
 
 
 def tokenize_corpus(lines, tok, cache_path=None):
-    """Tokenize text lines, with optional disk caching."""
+    """Tokenize text lines, with optional disk caching. Uses batch encoding for speed."""
     if cache_path and os.path.exists(cache_path):
         print(f"  Loading cached tokens: {cache_path}")
         return np.load(cache_path).tolist()
 
+    # Use encode_batch for 10-20x faster tokenization (HuggingFace tokenizers)
     all_ids = []
-    for line in lines:
-        ids = tok.encode(line)
-        if ids:
-            all_ids.extend(ids)
+    raw_tok = tok.tokenizer if hasattr(tok, 'tokenizer') else None
+    if raw_tok and hasattr(raw_tok, 'encode_batch'):
+        CHUNK = 10000
+        for i in range(0, len(lines), CHUNK):
+            batch = lines[i:i + CHUNK]
+            encoded = raw_tok.encode_batch(batch)
+            for enc in encoded:
+                if enc.ids:
+                    all_ids.extend(enc.ids)
+            if (i // CHUNK) % 10 == 0 and i > 0:
+                print(f"    Tokenized {i:,}/{len(lines):,} lines ({len(all_ids):,} tokens)...")
+    else:
+        for line in lines:
+            ids = tok.encode(line)
+            if ids:
+                all_ids.extend(ids)
 
     if cache_path:
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -442,16 +483,19 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
             print(f"  wandb init failed: {e}")
             wb_run = None
 
-    # torch.compile: only worth it for models >= 50M params
     n_params = sum(p.numel() for p in model.parameters())
-    if torch.cuda.is_available() and n_params >= 50_000_000 and hasattr(model, 'compile_model'):
+    # torch.compile: only for large models (>=50M) WITHOUT gradient checkpointing
+    # (compiled submodules inside checkpointed layers cause recompilation storms/crashes)
+    use_ckpt = getattr(model, 'use_checkpoint', False)
+    if torch.cuda.is_available() and n_params >= 50_000_000 and hasattr(model, 'compile_model') and not use_ckpt:
         try:
             model.compile_model(mode='default')
             print("  torch.compile: enabled (default mode)")
         except Exception as e:
             print(f"  torch.compile: skipped ({e})")
     else:
-        print(f"  torch.compile: skipped ({n_params/1e6:.0f}M params < 50M threshold)")
+        reason = f"{n_params/1e6:.0f}M params < 50M" if n_params < 50_000_000 else "checkpoint=True (incompatible)"
+        print(f"  torch.compile: skipped ({reason})")
 
     # V4.3.2: Use per-group LR optimizer if available (kernel params at 50x LR)
     if hasattr(model, 'configure_optimizer'):
@@ -542,8 +586,13 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
 
             if step % eval_interval == 0 or tokens_seen >= total_token_budget:
                 # Monitor: full snapshot (gradients still alive before next zero_grad)
+                # Save incrementally so data survives crashes/stops
                 if monitor:
                     monitor.snapshot(step, sample_input=x[:2])
+                    try:
+                        monitor.save_report()
+                    except Exception:
+                        pass
                 vl, vp, va = evaluate(model, val_data, batch_size, vocab_size, device, use_amp)
                 elapsed = time.time() - t0
                 tps = tokens_seen / elapsed
@@ -698,7 +747,7 @@ def main():
         print(f"  Resume: enabled")
 
     # Load data + tokenizer
-    splits, dataset_name = load_wikitext()
+    splits, dataset_name = load_dataset_splits()
     cache_dir = os.path.join(os.path.dirname(__file__), '..', 'results', 'cache')
     print(f"\n  Training BPE tokenizer (8K vocab)...")
     raw_tok = train_bpe_tokenizer(splits['train'], vocab_size=8000, cache_dir=cache_dir)
@@ -735,6 +784,11 @@ def main():
         cfg = SCALE_CONFIGS[scale_key]
         seq_len = cfg['seq_len']
         batch_size = cfg['batch_size']
+
+        # Batch size override via env var
+        batch_override = os.environ.get('BATCH_SIZE', '').strip()
+        if batch_override:
+            batch_size = int(batch_override)
 
         print(f"\n{'='*72}")
         print(f"  SCALE: {cfg['name']}")

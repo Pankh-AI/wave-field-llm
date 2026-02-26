@@ -82,7 +82,7 @@ def test_causality():
         diff = (logits_a[0, pos] - logits_b[0, pos]).abs().max().item()
         max_diffs.append(diff)
         bar_len = min(int(diff * 100), 50)
-        bar = "█" * bar_len + "░" * (50 - bar_len)
+        bar = "#" * bar_len + "." * (50 - bar_len)
         print(f"  Pos {pos}: {bar} {diff:.6f}")
 
     # Test 3: Try with different sequence lengths

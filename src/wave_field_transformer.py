@@ -75,10 +75,7 @@ class WaveFieldTransformerLayer(nn.Module):
                  use_3d_interference=False,
                  use_kernel_mixture=False, num_basis_kernels=4,
                  layer_idx=0, num_layers=1,
-                 device='cuda',
-                 feature_map_activation='normalized_exp',
-                 spectral_gate_init_scale=0.1,
-                 damping_range=(-3.0, 0.0)):
+                 device='cuda'):
         super().__init__()
 
         self.attention = WaveFieldAttention(
@@ -96,10 +93,7 @@ class WaveFieldTransformerLayer(nn.Module):
             num_basis_kernels=num_basis_kernels,
             layer_idx=layer_idx,
             num_layers=num_layers,
-            device=device,
-            feature_map_activation=feature_map_activation,
-            spectral_gate_init_scale=spectral_gate_init_scale,
-            damping_range=damping_range,
+            device=device
         )
         
         self.ffn = nn.Sequential(
@@ -237,11 +231,7 @@ class WaveFieldTransformer(nn.Module):
                  use_write_gate=True,
                  use_3d_interference=False,
                  use_kernel_mixture=False,
-                 num_basis_kernels=4,
-                 # V4.3.4 ablation knobs
-                 feature_map_activation='normalized_exp',
-                 spectral_gate_init_scale=0.1,
-                 damping_range=(-3.0, 0.0)):
+                 num_basis_kernels=4):
         super().__init__()
 
         self.vocab_size = vocab_size
@@ -281,10 +271,7 @@ class WaveFieldTransformer(nn.Module):
                 num_basis_kernels=num_basis_kernels,
                 layer_idx=layer_idx,
                 num_layers=num_layers,
-                device=self.device,
-                feature_map_activation=feature_map_activation,
-                spectral_gate_init_scale=spectral_gate_init_scale,
-                damping_range=damping_range
+                device=self.device
             )
             for layer_idx in range(num_layers)
         ])
@@ -342,15 +329,9 @@ class WaveFieldTransformer(nn.Module):
                             nn.init.eye_(module.weight)
                             nn.init.zeros_(module.bias)
 
-                # Spectral gate: restore output init (skip if kernel mixture)
-                # Scale stored on the SpectralGate instance (default 0.1 for V4.3.4).
+                # Spectral gate: restore near-zero output init (skip if kernel mixture)
                 if attn.spectral_gate is not None:
-                    sg_scale = attn.spectral_gate.init_scale
-                    with torch.no_grad():
-                        attn.spectral_gate.net[-1].weight.mul_(0.0)
-                        attn.spectral_gate.net[-1].weight.add_(
-                            torch.randn_like(attn.spectral_gate.net[-1].weight) * sg_scale
-                        )
+                    nn.init.normal_(attn.spectral_gate.net[-1].weight, 0, 0.001)
                     nn.init.zeros_(attn.spectral_gate.net[-1].bias)
 
                 # Kernel mixture: restore zero init for projection, warm bias for basis 1
