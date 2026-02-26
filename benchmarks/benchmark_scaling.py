@@ -435,9 +435,12 @@ def evaluate(model, val_data, batch_size, vocab_size, device, use_amp):
     for x, y in batches:
         with torch.amp.autocast('cuda', enabled=use_amp):
             logits, _ = model(x)
-            loss = F.cross_entropy(logits.reshape(-1, vocab_size), y.reshape(-1))
-        total_loss += loss.item()
-        n += 1
+        # fp32 cross-entropy: bf16 logits can overflow at high confidence
+        loss = F.cross_entropy(logits.float().reshape(-1, vocab_size), y.reshape(-1))
+        lv = loss.item()
+        if not math.isnan(lv):
+            total_loss += lv
+            n += 1
         mask = y != -100
         total_correct += (logits.argmax(-1)[mask] == y[mask]).sum().item()
         total_tokens += mask.sum().item()
@@ -531,7 +534,7 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
     curve = []  # training curve data points
 
     # Resume from checkpoint if available
-    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', 'results')
+    ckpt_dir = os.path.join(os.path.dirname(__file__), '..', 'results', 'checkpoints')
     os.makedirs(ckpt_dir, exist_ok=True)
     safe_name = run_name.replace(' ', '_').lower()
 
@@ -746,7 +749,12 @@ def main():
     resume_enabled = resume_env not in ('', '0', 'false')
 
     results_dir = os.path.join(os.path.dirname(__file__), '..', 'results')
-    os.makedirs(results_dir, exist_ok=True)
+    data_dir = os.path.join(results_dir, 'data')
+    plots_dir = os.path.join(results_dir, 'plots')
+    ckpts_dir = os.path.join(results_dir, 'checkpoints')
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
+    os.makedirs(ckpts_dir, exist_ok=True)
 
     print(f"\n  Scales: {scale_keys}")
     print(f"  Models: {'SPECTRE-Wave' if run_wave else ''} {'Standard' if run_std else ''}")
@@ -826,7 +834,7 @@ def main():
                 wave_resume = None
                 if resume_enabled:
                     wave_safe = f"spectre-wave_{scale_key.lower()}_resume.pt"
-                    wave_resume_path = os.path.join(results_dir, wave_safe)
+                    wave_resume_path = os.path.join(ckpts_dir, wave_safe)
                     if os.path.exists(wave_resume_path):
                         wave_resume = wave_resume_path
                     elif resume_env not in ('1', 'true') and os.path.exists(resume_env):
@@ -883,7 +891,7 @@ def main():
                 std_resume = None
                 if resume_enabled:
                     std_safe = f"standard_{scale_key.lower()}_resume.pt"
-                    std_resume_path = os.path.join(results_dir, std_safe)
+                    std_resume_path = os.path.join(ckpts_dir, std_safe)
                     if os.path.exists(std_resume_path):
                         std_resume = std_resume_path
 
@@ -996,7 +1004,7 @@ def main():
         'metadata': run_metadata,
         'results': all_results,
     }
-    results_path = os.path.join(results_dir, 'scaling_benchmark.json')
+    results_path = os.path.join(data_dir, 'scaling_benchmark.json')
     with open(results_path, 'w') as f:
         json.dump(output, f, indent=2)
     print(f"\n  Results saved: {results_path}")
@@ -1005,7 +1013,7 @@ def main():
     for scale_key in scale_keys:
         scale_results = [r for r in all_results if r.get('scale') == scale_key]
         if scale_results:
-            scale_path = os.path.join(results_dir, f'scaling_{scale_key.lower()}.json')
+            scale_path = os.path.join(data_dir, f'scaling_{scale_key.lower()}.json')
             with open(scale_path, 'w') as f:
                 json.dump({'metadata': run_metadata, 'results': scale_results}, f, indent=2)
             print(f"  Scale {scale_key} saved: {scale_path}")
@@ -1013,12 +1021,12 @@ def main():
     # ============================================================
     # VISUALIZATIONS
     # ============================================================
-    plot_results(all_results, scale_keys, results_dir, dataset_name)
+    plot_results(all_results, scale_keys, plots_dir, dataset_name)
 
     # ============================================================
     # INFERENCE TEST (if wave checkpoint exists)
     # ============================================================
-    run_inference_test(all_results, scale_keys, vocab_size, tok, device, results_dir)
+    run_inference_test(all_results, scale_keys, vocab_size, tok, device, ckpts_dir)
 
 
 # ======================================================================

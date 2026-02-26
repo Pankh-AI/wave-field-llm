@@ -61,11 +61,14 @@ docs/                       # Documentation
   plans/                    #   Design plans
 
 results/                    # Generated output (gitignored, Docker volume mount)
-  *.json                    #   Benchmark data
-  *.png                     #   Plots and dashboards
+  figures/                  #   README/publication figures (fig_*.png, v435_*.png/gif)
+  announce/                 #   Shareable announcement graphics
+  data/                     #   Benchmark JSON results (scaling_s1.json, etc.)
   checkpoints/              #   Model checkpoints (.pt files)
-  monitor/                  #   Training monitor output
-  monitor_test/             #   Monitor test runs
+  plots/                    #   Auto-generated benchmark plots
+  monitor/                  #   Training monitor snapshots
+  legacy/                   #   Old version plots/scripts (V4.3.2, V5, etc.)
+  cache/                    #   HF dataset/tokenizer cache
 
 tokenizers/                 # Custom tokenizer implementations
 ```

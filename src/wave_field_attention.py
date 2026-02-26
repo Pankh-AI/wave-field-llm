@@ -226,8 +226,13 @@ class WaveFieldAttention(nn.Module):
         if use_write_gate:
             self.write_gate_proj = nn.Linear(self.head_dim, 1, bias=True)
 
-        # Pad to cuFFT-friendly size (prime factors <= 7)
-        self._fast_pad_size = _next_fast_size(2 * field_size)
+        # Pad to cuFFT-friendly size (prime factors <= 7).
+        # 4x padding (not 2x) to prevent FFT circular wraparound leaking future
+        # tokens when field_size ≈ seq_len. With 2x, fp32 precision errors in the
+        # IFFT→zero→FFT causal enforcement chain create ~1e-4 leakage at init that
+        # training amplifies to ~10 logit diffs. 4x padding gives enough zero-buffer
+        # to keep leakage at ~1e-7 (harmless). Cost: ~2x larger FFT.
+        self._fast_pad_size = _next_fast_size(4 * field_size)
         # rfft(n=pad) produces pad//2 + 1 complex frequency bins
         self.freq_bins = self._fast_pad_size // 2 + 1
 

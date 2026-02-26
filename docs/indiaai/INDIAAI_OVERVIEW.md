@@ -74,6 +74,6 @@ We won't sugarcoat it:
 
 ---
 
-**Contact:** Badaramoni Avinash | Pankh AI (DPIIT Registered)
+**Contact:** Pankaj Kharkwal | Pankh AI (DPIIT Registered)
 **Repository:** GitHub — Pankh-AI/wave-field-llm
 **License:** AGPL-3.0

@@ -3,7 +3,7 @@
 ## Wave Field LLM: Physics-Based O(n log n) Language Model
 
 **Applicant:** Pankh AI (DPIIT Registered Startup)
-**Project Lead:** Badaramoni Avinash
+**Project Lead:** Pankaj Kharkwal
 **Date:** February 2026
 **License:** AGPL-3.0 (fully open-source, network-use disclosure required)
 
@@ -190,7 +190,7 @@ At cloud market rates, this work would cost **₹11.6 lakh**. The IndiaAI subsid
 
 ## 8. Team
 
-**Badaramoni Avinash** — Solo developer/researcher. Designed, implemented, and benchmarked the entire architecture. Background in physics-informed computing.
+**Pankaj Kharkwal** — Solo developer/researcher. Designed, implemented, and benchmarked the entire architecture. Background in physics-informed computing.
 
 **Pankh AI** — DPIIT-registered startup focused on AI research and development.
 
