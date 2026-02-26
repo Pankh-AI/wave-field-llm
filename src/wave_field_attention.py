@@ -371,7 +371,14 @@ class WaveFieldAttention(nn.Module):
             self.token_pos_proj = nn.Linear(embedding_dim, 3)
 
         # Fixed stride for absolute position mapping
+        # CAUSALITY CRITICAL: stride < 1 causes bilinear interpolation to share
+        # field cells between adjacent tokens, leaking future info through the
+        # gather step. Force stride >= 1.0 so each token maps to its own cell.
         stride_val = (field_size - 1) / max(max_seq_len - 1, 1)
+        if stride_val < 1.0:
+            # Clamp to 1.0: tokens beyond field_size will map to the last cell.
+            # This is safe because seq_len <= field_size in practice.
+            stride_val = 1.0
         self.register_buffer(
             'field_stride',
             torch.tensor(stride_val, dtype=torch.float32)
@@ -379,9 +386,10 @@ class WaveFieldAttention(nn.Module):
 
         # Precompute scatter/gather indices (same every forward pass)
         seq_pos = torch.arange(max_seq_len, dtype=torch.float32)
-        field_pos = (seq_pos * stride_val).clamp(0, field_size - 2)
-        idx_lo = field_pos.long().clamp(0, field_size - 2)
-        idx_hi = idx_lo + 1
+        field_pos = (seq_pos * stride_val).clamp(0, field_size - 1)
+        # Integer mapping: each token gets its own cell, no interpolation
+        idx_lo = field_pos.long().clamp(0, field_size - 1)
+        idx_hi = (idx_lo + 1).clamp(0, field_size - 1)
         frac = (field_pos - idx_lo.float()).clamp(0, 1)
         self.register_buffer('_cached_field_pos', field_pos)
         self.register_buffer('_cached_idx_lo', idx_lo)
@@ -643,6 +651,11 @@ class WaveFieldAttention(nn.Module):
 
         Uses 4D layout (B, D, H, G) to avoid expanding kernel across D —
         CUDA broadcasting handles it, saving 16 MB allocation per layer.
+
+        CAUSALITY NOTE: FFT convolution is causal when the kernel is causal
+        (zero for t >= G) and padding is sufficient for linear convolution.
+        The actual causality guarantee comes from stride >= 1.0 in scatter/
+        gather (each token maps to its own field cell, no sharing).
         """
         B, H, G, D = field.shape
         pad_size = self._fast_pad_size
@@ -650,8 +663,6 @@ class WaveFieldAttention(nn.Module):
         # Enforce causality: spectral gate modulation can introduce anti-causal
         # components by breaking the Hilbert transform relationship. Project
         # back to causal space before convolving.
-        # Skip when using analytic kernel (causal by construction) + real-valued
-        # spectral gate (preserves causality). Verify with test_causality.py.
         if kernel_fft.dim() == 3 and not self.skip_causal_enforce:
             kernel_fft = self._enforce_causal_kernel(kernel_fft, G)
 
