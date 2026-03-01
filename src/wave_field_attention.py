@@ -76,13 +76,16 @@ class ELUPlus1(nn.Module):
 class LearnedFeatureMap(nn.Module):
     """Learned positive feature map for linear attention (Hedgehog, ICLR 2024).
 
-    MLP of `depth` identity-initialized Linear(d,d) + ReLU layers.
-    At init: phi(x) = ReLU(Ix) + eps — 50% sparse, rank d/2.
+    MLP of `depth` identity-initialized Linear(d,d) + activation layers.
+    At init: phi(x) ≈ ReLU(Ix) + eps — 50% sparse, rank d/2.
     During training: learns spiky, dot-product-monotonic maps that mimic softmax.
 
-    V4.3.4: Reverted to ReLU from ELU+1. ELU+1 collapsed effective rank to 2.3
-    because ELU(0)+1=1 maps all outputs ≈ [1,1,...,1]. ReLU's 50% zeroed dims
-    give rank d/2 = 24 >> 2.3. The eps floor ensures positivity for linear attn.
+    V4.3.8: Intermediate layers use GELU (no dead neurons, smooth gradients).
+    Final layer keeps ReLU for positivity guarantee (linear attention needs φ>0).
+    V4.3.7 had 59% dead Q neurons from ReLU killing neurons permanently.
+    GELU intermediates allow gradient flow even for negative inputs, while
+    final ReLU still ensures positivity. Dead neurons can recover because
+    upstream GELU gradients update the first Linear, shifting inputs positive.
 
     depth=1: original V4.3 (single linear).
     depth=2: Hedgehog-style (closes 68.6% of linear-vs-softmax gap at 125M scale).
@@ -92,13 +95,16 @@ class LearnedFeatureMap(nn.Module):
         super().__init__()
         self.eps = eps
         layers = []
-        for _ in range(depth):
+        for i in range(depth):
             lin = nn.Linear(dim, dim, bias=True)
             with torch.no_grad():
                 nn.init.eye_(lin.weight)
                 nn.init.zeros_(lin.bias)
             layers.append(lin)
-            layers.append(nn.ReLU())
+            if i < depth - 1:
+                layers.append(nn.GELU())   # intermediate: no dead neurons
+            else:
+                layers.append(nn.ReLU())   # final: ensures positivity for linear attn
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -184,6 +190,7 @@ class WaveFieldAttention(nn.Module):
                  use_kernel_mixture=False, num_basis_kernels=4,
                  layer_idx=0, num_layers=1,
                  skip_causal_enforce=False,
+                 n_frozen_heads=0,
                  device='cuda'):
         super().__init__()
 
@@ -300,9 +307,15 @@ class WaveFieldAttention(nn.Module):
                 [math.pi * (2 * n + 1) / 2 for n in range(H)]
             ) * freq_scale
 
-            # Damping: softplus(-1.4)=0.22 (L0, long reach) to softplus(0.0)=0.69 (last, local)
-            damp_raw = -1.4 + 1.4 * layer_frac if num_layers > 1 else -0.69
-            hippo_damp = torch.full((H,), damp_raw)
+            # Damping: per-HEAD diversity within each layer (V4.3.8)
+            # V4.3.7 had all heads at same damping → all collapsed to high damping
+            # (reach ~2 tokens). Now spread heads from low damping (long range) to
+            # high damping (short range) within each layer.
+            # Layer center: softplus(-1.4)=0.22 (L0) to softplus(0.0)=0.69 (last)
+            damp_center = -1.4 + 1.4 * layer_frac if num_layers > 1 else -0.69
+            damp_spread = 0.7  # half-range for per-head diversity
+            hippo_damp = torch.linspace(damp_center - damp_spread,
+                                        damp_center + damp_spread, H)
 
             # Phase: offset per layer for inter-layer diversity
             phase_offset = (math.pi / max(num_layers, 1)) * layer_idx
@@ -312,6 +325,24 @@ class WaveFieldAttention(nn.Module):
             self.wave_damping = nn.Parameter(hippo_damp)
             self.wave_phase = nn.Parameter(hippo_phase)
             self.component_weights = None
+
+            # V4.3.9: Frozen damping heads — prevent training from collapsing
+            # all heads to high damping (bigram shortcut). First n_frozen_heads
+            # get log-spaced damping from α=0.05 (reach 184 tokens) to α=0.35
+            # (reach 26 tokens). These values are buffers, not parameters, so
+            # gradients don't flow and training can't move them.
+            if n_frozen_heads > 0 and n_frozen_heads < H:
+                frozen_mask = torch.zeros(H, dtype=torch.bool)
+                frozen_mask[:n_frozen_heads] = True
+                frozen_alphas = torch.zeros(H)
+                frozen_alphas[:n_frozen_heads] = torch.exp(torch.linspace(
+                    math.log(0.05), math.log(0.35), n_frozen_heads
+                ))
+                self.register_buffer('_frozen_damping_mask', frozen_mask)
+                self.register_buffer('_frozen_damping_values', frozen_alphas)
+            else:
+                self.register_buffer('_frozen_damping_mask', None)
+                self.register_buffer('_frozen_damping_values', None)
         else:
             # Multi-component wavelet: (H, C) params with multi-resolution init
             # Each component covers a different scale — from broad to sharp
@@ -342,6 +373,10 @@ class WaveFieldAttention(nn.Module):
             self.wave_damping = nn.Parameter(damp_init)        # (H, C)
             self.wave_phase = nn.Parameter(phase_init)         # (H, C)
             self.component_weights = nn.Parameter(torch.zeros(H, C))  # uniform after softmax
+
+            # Multi-component: frozen damping not supported (would need per-C values)
+            self.register_buffer('_frozen_damping_mask', None)
+            self.register_buffer('_frozen_damping_values', None)
 
         # ---- LOCAL ATTENTION (near-field) ----
         if local_window > 0:
@@ -427,14 +462,25 @@ class WaveFieldAttention(nn.Module):
 
         if self.n_components == 1:
             # Single component: params are (H,) — exact V3.5 path
-            alpha = F.softplus(self.wave_damping).unsqueeze(1)   # (H, 1)
+            # V4.3.8: Cap damping at 0.5 to prevent kernel reach collapse.
+            # V4.3.9: Frozen heads bypass cap — use fixed values for multi-scale reach.
+            alpha = F.softplus(self.wave_damping)
+            if self._frozen_damping_mask is not None:
+                alpha = torch.where(
+                    self._frozen_damping_mask,
+                    self._frozen_damping_values,
+                    alpha.clamp(max=0.5)
+                )
+            else:
+                alpha = alpha.clamp(max=0.5)
+            alpha = alpha.unsqueeze(1)   # (H, 1)
             omega = self.wave_frequency.unsqueeze(1)              # (H, 1)
             phi = self.wave_phase.unsqueeze(1)                    # (H, 1)
 
             kernels = torch.exp(-alpha * t.unsqueeze(0)) * torch.cos(omega * t.unsqueeze(0) + phi)
         else:
             # Multi-component: params are (H, C), sum weighted components
-            alpha = F.softplus(self.wave_damping).unsqueeze(2)   # (H, C, 1)
+            alpha = F.softplus(self.wave_damping).clamp(max=0.5).unsqueeze(2)   # (H, C, 1)
             omega = self.wave_frequency.unsqueeze(2)              # (H, C, 1)
             phi = self.wave_phase.unsqueeze(2)                    # (H, C, 1)
             t_exp = t.unsqueeze(0).unsqueeze(0)                   # (1, 1, G)
@@ -498,7 +544,16 @@ class WaveFieldAttention(nn.Module):
         freq_bins = self.freq_bins  # rfft output size for n=pad_size
 
         # Complex pole: lambda = -alpha + i*omega
-        alpha = F.softplus(self.wave_damping)  # (H,) positive damping
+        # V4.3.9: Frozen heads bypass cap (same logic as time-domain path)
+        alpha = F.softplus(self.wave_damping)
+        if self._frozen_damping_mask is not None:
+            alpha = torch.where(
+                self._frozen_damping_mask,
+                self._frozen_damping_values,
+                alpha.clamp(max=0.5)
+            )
+        else:
+            alpha = alpha.clamp(max=0.5)  # (H,) positive damping
         omega = self.wave_frequency             # (H,) frequency
         phi = self.wave_phase                   # (H,) phase
 

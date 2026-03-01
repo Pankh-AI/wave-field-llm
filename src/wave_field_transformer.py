@@ -76,6 +76,7 @@ class WaveFieldTransformerLayer(nn.Module):
                  use_kernel_mixture=False, num_basis_kernels=4,
                  layer_idx=0, num_layers=1,
                  skip_causal_enforce=False,
+                 n_frozen_heads=0,
                  device='cuda'):
         super().__init__()
 
@@ -95,6 +96,7 @@ class WaveFieldTransformerLayer(nn.Module):
             layer_idx=layer_idx,
             num_layers=num_layers,
             skip_causal_enforce=skip_causal_enforce,
+            n_frozen_heads=n_frozen_heads,
             device=device
         )
         
@@ -234,7 +236,8 @@ class WaveFieldTransformer(nn.Module):
                  use_3d_interference=False,
                  use_kernel_mixture=False,
                  num_basis_kernels=4,
-                 skip_causal_enforce=False):
+                 skip_causal_enforce=False,
+                 n_frozen_heads=0):
         super().__init__()
 
         self.vocab_size = vocab_size
@@ -275,6 +278,7 @@ class WaveFieldTransformer(nn.Module):
                 layer_idx=layer_idx,
                 num_layers=num_layers,
                 skip_causal_enforce=skip_causal_enforce,
+                n_frozen_heads=n_frozen_heads,
                 device=self.device
             )
             for layer_idx in range(num_layers)
