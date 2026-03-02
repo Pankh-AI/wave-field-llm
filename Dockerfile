@@ -16,11 +16,18 @@ COPY . .
 # Results directory (volume mount target)
 RUN mkdir -p /app/results
 
+# Force unbuffered Python output (critical for Docker log visibility)
+ENV PYTHONUNBUFFERED=1
+
 # Benchmark config — override any of these at runtime
 ENV BENCHMARK=benchmarks/benchmark_scaling.py
 ENV SCALE=""
 ENV DATASET=2
 ENV MODEL=""
 ENV CONFIGS=""
+ENV TOKEN_BUDGET=""
+ENV FROZEN_HEADS=""
+ENV LOCAL_WINDOW=""
+ENV RESULTS_VERSION=""
 
-CMD ["sh", "-c", "python $BENCHMARK"]
+CMD ["sh", "-c", "python -u $BENCHMARK"]

@@ -366,9 +366,11 @@ def create_batches(data, batch_size, device, shuffle=True):
 
 def create_wave_model(vocab_size, cfg, device):
     """Create SPECTRE-Wave model for a given scale config."""
-    use_ckpt = cfg.get('use_checkpoint', True)
-    local_window = int(os.environ.get('LOCAL_WINDOW', '0'))
-    n_frozen_heads = int(os.environ.get('FROZEN_HEADS', '0'))
+    ckpt_env = os.environ.get('USE_CHECKPOINT', '').strip().lower()
+    use_ckpt = (ckpt_env != '0') if ckpt_env else cfg.get('use_checkpoint', True)
+    local_window = int(os.environ.get('LOCAL_WINDOW', '') or '0')
+    n_frozen_heads = int(os.environ.get('FROZEN_HEADS', '') or '0')
+    use_split_step = os.environ.get('SPLIT_STEP', '') == '1'
     model = WaveFieldTransformer(
         vocab_size=vocab_size,
         embedding_dim=cfg['embedding_dim'],
@@ -383,6 +385,7 @@ def create_wave_model(vocab_size, cfg, device):
         n_components=1,
         local_window=local_window,
         n_frozen_heads=n_frozen_heads,
+        use_split_step=use_split_step,
         device=device,
     ).to(device)
     if local_window > 0 or n_frozen_heads > 0:
@@ -451,6 +454,9 @@ def evaluate(model, val_data, batch_size, vocab_size, device, use_amp):
         total_correct += (logits.argmax(-1)[mask] == y[mask]).sum().item()
         total_tokens += mask.sum().item()
     model.train()
+    # Free eval temporaries before training resumes (prevents VRAM fragmentation)
+    del batches
+    torch.cuda.empty_cache()
     avg_loss = total_loss / max(n, 1)
     ppl = math.exp(min(avg_loss, 20))
     acc = total_correct / max(total_tokens, 1) * 100
@@ -619,24 +625,28 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
                     best_acc = va
                     mark = " *BEST"
                     # Save best weights (lightweight, for inference)
-                    best_path = os.path.join(ckpt_dir, f'{safe_name}.pt')
-                    torch.save(model.state_dict(), best_path)
+                    if os.environ.get('NO_SAVE', '') != '1':
+                        best_path = os.path.join(ckpt_dir, f'{safe_name}.pt')
+                        torch.save(model.state_dict(), best_path)
                 # Save resumable checkpoint (full training state) every eval
-                resume_ckpt_path = os.path.join(ckpt_dir, f'{safe_name}_resume.pt')
-                torch.save({
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scaler': scaler.state_dict(),
-                    'scheduler_step': scheduler.step_count,
-                    'step': step,
-                    'epoch': epoch,
-                    'tokens_seen': tokens_seen,
-                    'best_val_loss': best_val_loss,
-                    'best_ppl': best_ppl,
-                    'best_acc': best_acc,
-                    'curve': curve,
-                    'seed': seed,
-                }, resume_ckpt_path)
+                if os.environ.get('NO_SAVE', '') != '1':
+                    resume_ckpt_path = os.path.join(ckpt_dir, f'{safe_name}_resume.pt')
+                    torch.save({
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'scaler': scaler.state_dict(),
+                        'scheduler_step': scheduler.step_count,
+                        'step': step,
+                        'epoch': epoch,
+                        'tokens_seen': tokens_seen,
+                        'best_val_loss': best_val_loss,
+                        'best_ppl': best_ppl,
+                        'best_acc': best_acc,
+                        'curve': curve,
+                        'seed': seed,
+                    }, resume_ckpt_path)
+                gc.collect()
+                torch.cuda.empty_cache()
                 print(f"    Step {step:>5}/{total_steps} | "
                       f"Tokens {tokens_seen/1e6:.1f}M | "
                       f"Val PPL {vp:>7.1f} Acc {va:>5.1f}% | "
@@ -821,6 +831,11 @@ def main():
         # Prepare data for this scale
         train_data = make_chunks(train_ids, seq_len)
         val_data = make_chunks(val_ids, seq_len)
+
+        # Token budget override
+        budget_override = os.environ.get('TOKEN_BUDGET', '').strip()
+        if budget_override:
+            cfg['token_budget'] = int(budget_override)
 
         # Check if we have enough data for the token budget
         avail_tokens = len(train_data) * seq_len

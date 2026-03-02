@@ -62,6 +62,164 @@ services:
       - SCALE=S3
       - DATASET=103
 
+  # Long-context: 2K seq — speed crossover zone (~15 min on 3060)
+  lc-2k:
+    build: .
+    container_name: wave-lc-2k
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_long_context.py
+      - CONFIGS=K,L
+      - FROZEN_HEADS=4
+      - TOKEN_BUDGET=5000000
+
+  # Long-context: 4K seq — the real test (~20 min on 3060)
+  lc-4k:
+    build: .
+    container_name: wave-lc-4k
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_long_context.py
+      - CONFIGS=C,D
+      - FROZEN_HEADS=4
+      - TOKEN_BUDGET=5000000
+
+  # Long-context: 2K+4K sweet spot combined (~35 min on 3060)
+  lc-sweet:
+    build: .
+    container_name: wave-lc-sweet
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_long_context.py
+      - CONFIGS=K,L,C,D
+      - FROZEN_HEADS=4
+      - TOKEN_BUDGET=5000000
+
+  # Experiment A: PPL Gap vs Sequence Length — all 6 configs (~1.5 hrs on 3060)
+  exp-a:
+    build: .
+    container_name: wave-exp-a
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_seq_scaling.py
+      - DATASET=103
+      - CONFIGS=W512,S512,W2K,S2K,W4K,S4K
+      - FROZEN_HEADS=4
+      - TOKEN_BUDGET=20000000
+
+  # Experiment A: seq=512 pair only (~25 min)
+  exp-a-512:
+    build: .
+    container_name: wave-exp-a-512
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_seq_scaling.py
+      - DATASET=103
+      - CONFIGS=W512,S512
+      - FROZEN_HEADS=4
+      - TOKEN_BUDGET=20000000
+
+  # Experiment A: seq=2048 pair only (~35 min)
+  exp-a-2k:
+    build: .
+    container_name: wave-exp-a-2k
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_seq_scaling.py
+      - DATASET=103
+      - CONFIGS=W2K,S2K
+      - FROZEN_HEADS=4
+      - TOKEN_BUDGET=20000000
+
+  # Experiment A: seq=4096 pair only (~50 min)
+  exp-a-4k:
+    build: .
+    container_name: wave-exp-a-4k
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_seq_scaling.py
+      - DATASET=103
+      - CONFIGS=W4K,S4K
+      - FROZEN_HEADS=4
+      - TOKEN_BUDGET=20000000
+
   # V4.3 benchmark (original 5M token comparison)
   v43:
     build: .

@@ -42,6 +42,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
 
 
 def _next_fast_size(n):
@@ -191,6 +192,8 @@ class WaveFieldAttention(nn.Module):
                  layer_idx=0, num_layers=1,
                  skip_causal_enforce=False,
                  n_frozen_heads=0,
+                 use_monarch_fft=None,
+                 use_split_step=None,
                  device='cuda'):
         super().__init__()
 
@@ -242,6 +245,35 @@ class WaveFieldAttention(nn.Module):
         self._fast_pad_size = _next_fast_size(4 * field_size)
         # rfft(n=pad) produces pad//2 + 1 complex frequency bins
         self.freq_bins = self._fast_pad_size // 2 + 1
+
+        # Optional Monarch FFT: tensor-core-friendly FFT via matmul decomposition
+        # Enable via use_monarch_fft=True or MONARCH_FFT=1 env var
+        if use_monarch_fft is None:
+            use_monarch_fft = os.environ.get('MONARCH_FFT', '0') == '1'
+        self.use_monarch_fft = use_monarch_fft
+        self._monarch = None
+        if use_monarch_fft:
+            from src.fft_optimizer import MonarchFFT
+            self._monarch = MonarchFFT(n=self._fast_pad_size, dtype=torch.float32)
+            if layer_idx == 0:
+                print(f"  [MonarchFFT] Enabled: pad={self._fast_pad_size}, "
+                      f"factors=({self._monarch.P},{self._monarch.Q})")
+
+        # V4.4: Split-Step Kerr nonlinearity — breaks LTI constraint
+        # After FFT convolution, apply pointwise |field|^2 * field (Kerr effect).
+        # This makes large-amplitude tokens (important content) propagate
+        # differently from small ones, achieving content-dependent routing
+        # without extra FFTs. Learnable gamma per head controls strength.
+        # Enable via use_split_step=True or SPLIT_STEP=1 env var.
+        if use_split_step is None:
+            use_split_step = os.environ.get('SPLIT_STEP', '0') == '1'
+        self.use_split_step = use_split_step
+        if use_split_step:
+            # Per-head learnable strength. Saturable form bounds gain to (1+gamma).
+            # With gamma=0.5, max gain = 1.5x. Clamped to [0, 2] in forward.
+            self.kerr_gamma = nn.Parameter(torch.full((num_heads,), 0.5))
+            if layer_idx == 0:
+                print(f"  [SplitStep] Saturable Kerr enabled (gamma_init=0.5, clamp=[0,2])")
 
         if use_kernel_mixture:
             # Content-Adaptive Kernel Mixture: K basis kernels, per-token mixing
@@ -680,9 +712,14 @@ class WaveFieldAttention(nn.Module):
         Returns: same shape, causal-projected.
         """
         pad_size = self._fast_pad_size
-        kernel_td = torch.fft.irfft(kernel_fft, n=pad_size)  # (..., pad_size)
-        kernel_td[..., G:] = 0  # zero anti-causal half
-        return torch.fft.rfft(kernel_td, n=pad_size)
+        if self._monarch is not None:
+            kernel_td = self._monarch.irfft(kernel_fft, n=pad_size)
+            kernel_td[..., G:] = 0
+            return self._monarch.rfft(kernel_td)
+        else:
+            kernel_td = torch.fft.irfft(kernel_fft, n=pad_size)  # (..., pad_size)
+            kernel_td[..., G:] = 0  # zero anti-causal half
+            return torch.fft.rfft(kernel_td, n=pad_size)
 
     @staticmethod
     def _complex_mul_real(a_real, a_imag, b_real, b_imag):
@@ -726,7 +763,10 @@ class WaveFieldAttention(nn.Module):
 
         # FFT in fp32 for numerical stability (bf16 twiddle factors lose precision)
         input_dtype = field_t.dtype
-        field_fft = torch.fft.rfft(field_t.float(), n=pad_size)  # (B, D, H, freq)
+        if self._monarch is not None:
+            field_fft = self._monarch.rfft(field_t.float())    # (B, D, H, freq)
+        else:
+            field_fft = torch.fft.rfft(field_t.float(), n=pad_size)  # (B, D, H, freq)
 
         # Decompose complex multiply into real ops for Inductor fusion
         f_real, f_imag = field_fft.real, field_fft.imag
@@ -742,7 +782,10 @@ class WaveFieldAttention(nn.Module):
         out_real, out_imag = self._complex_mul_real(f_real, f_imag, k_real, k_imag)
         convolved_fft = torch.complex(out_real, out_imag)
 
-        convolved = torch.fft.irfft(convolved_fft, n=pad_size)[..., :G]  # (B, D, H, G)
+        if self._monarch is not None:
+            convolved = self._monarch.irfft(convolved_fft, n=pad_size)[..., :G]
+        else:
+            convolved = torch.fft.irfft(convolved_fft, n=pad_size)[..., :G]  # (B, D, H, G)
         convolved = convolved.to(input_dtype)
 
         return convolved.permute(0, 2, 3, 1)  # back to (B, H, G, D)
@@ -999,6 +1042,18 @@ class WaveFieldAttention(nn.Module):
 
             kernel_fft = self.spectral_gate(q, base_kernel_fft)  # (B, H, freq_bins)
             field = self._wave_convolve(field, kernel_fft)
+
+            # V4.4: Split-Step Kerr nonlinearity (saturable)
+            # field shape: (B, H, G, D). gamma: (H,) -> (1, H, 1, 1)
+            # Saturable Kerr: field = field * (1 + gamma * |field| / (1 + |field|))
+            # The denominator (1 + |field|) prevents explosive growth:
+            #   small |field| -> linear amplification (Kerr regime)
+            #   large |field| -> saturates at (1 + gamma) gain (stable)
+            # This models real-world saturable absorption in nonlinear optics.
+            if self.use_split_step:
+                gamma = self.kerr_gamma.clamp(0, 2.0).view(1, -1, 1, 1)  # (1, H, 1, 1)
+                field_abs = field.abs()
+                field = field * (1.0 + gamma * field_abs / (1.0 + field_abs))
 
             if self.use_3d_interference:
                 field = self._apply_3d_interference(field, x)
