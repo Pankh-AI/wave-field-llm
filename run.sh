@@ -59,7 +59,7 @@ case "$SERVICE" in
     echo -e "${GREEN}Done.${NC}"
     exit 0
     ;;
-  s1|s1-h1|s1-hybrid|s1-gla|s2|s3|v43|lc-2k|lc-4k|lc-sweet|exp-a|exp-a-512|exp-a-2k|exp-a-4k|battle-quick|battle-all)
+  s1|s1-h1|s1-hybrid|s1-delta|s1-2k|s1-gla|s2|s3|v43|lc-2k|lc-4k|lc-sweet|exp-a|exp-a-512|exp-a-2k|exp-a-4k|battle-quick|battle-all)
     # Get version for results tagging
     VERSION=$(python -c "import sys; sys.path.insert(0,'.'); from src import __version__; print(__version__)" 2>/dev/null || echo "unknown")
     echo -e "\n${YELLOW}[version]${NC} v${VERSION}"
@@ -98,7 +98,9 @@ case "$SERVICE" in
     echo "  lc-4k      4K seq only (~20 min)"
     echo "  s1         S1 scaling 22M params (~25 min)"
     echo "  s1-h1      S1 + local_window=64 (~25 min)"
-    echo "  s1-hybrid  S1 + hybrid (1 std attn layer at L3) (~25 min)"
+    echo "  s1-hybrid  S1 + hybrid (1 std attn layer at L3) (~15 min)"
+    echo "  s1-delta   S1 + delta-rule correction in wave layers (~15 min)"
+    echo "  s1-2k      S1 params, seq=2048 — where O(n log n) matters (~30 min)"
     echo "  s1-gla     S1 + GLA at L3,L7 (~25 min)"
     echo "  s2         S2 scaling 55M params (~2.3 hrs)"
     echo "  s3         S3 scaling 100M params (~9 hrs)"

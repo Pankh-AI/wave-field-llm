@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wave-Hymba Architecture — Parallel Head Design</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root {
+    --bg: #0c0c14; --surface: #13131f; --surface2: #1a1a2a; --border: #2a2a3d;
+    --text: #e0e0ee; --text2: #8888a0;
+    --accent: #00d4aa; --accent2: #00b4d8;
+    --wave: #0891b2; --attn: #dc2626; --ffn: #22c55e; --intf: #eab308; --math: #c084fc;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; line-height: 1.6; }
+
+  .page { max-width: 1100px; margin: 0 auto; padding: 40px 20px; }
+
+  h1 {
+    font-size: 32px; font-weight: 700; text-align: center;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .sub { text-align: center; color: var(--text2); font-size: 14px; margin: 8px 0 40px; }
+
+  /* Cards */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; padding: 28px 32px; margin-bottom: 24px;
+  }
+  .card h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+  .card h3 { font-size: 14px; font-weight: 600; color: var(--intf); margin: 20px 0 8px; }
+  .card .desc { color: var(--text2); font-size: 13px; margin-bottom: 16px; }
+
+  /* Diagram */
+  .diagram {
+    background: #0a0a18; border: 1px solid var(--border); border-radius: 12px;
+    padding: 24px; margin: 16px 0; overflow-x: auto;
+  }
+  .diagram svg { display: block; margin: 0 auto; }
+
+  /* Math */
+  .eq {
+    background: #0a0a18; border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 20px; margin: 12px 0; font-family: 'JetBrains Mono', monospace;
+    font-size: 13px; line-height: 2; color: #c0c0ff; overflow-x: auto;
+  }
+  .eq .label { font-family: 'Inter', sans-serif; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 1px; color: var(--text2); display: block; margin-bottom: 6px; }
+  .eq .hl { color: var(--accent); font-weight: 500; }
+  .eq .r { color: var(--attn); }
+  .eq .b { color: var(--wave); }
+  .eq .g { color: var(--ffn); }
+  .eq .dim { color: #666; }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 12px 0; }
+  th { text-align: left; padding: 10px 12px; color: var(--text2); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+  td { padding: 8px 12px; border-bottom: 1px solid #1a1a2a; }
+  tr:hover td { background: #ffffff05; }
+  .mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .pct { color: var(--intf); }
+  .good { color: var(--accent); }
+  .bad { color: var(--attn); }
+
+  /* Callout */
+  .callout {
+    border-radius: 10px; padding: 14px 18px; font-size: 13px; margin: 16px 0;
+    display: flex; gap: 10px; align-items: flex-start;
+  }
+  .callout-info { background: #0891b210; border: 1px solid #0891b230; }
+  .callout-warn { background: #f59e0b10; border: 1px solid #f59e0b30; }
+  .callout-key { background: #dc262610; border: 1px solid #dc262630; }
+  .callout-icon { font-size: 18px; }
+
+  /* Compare cols */
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+  .compare-box { background: var(--surface2); border-radius: 10px; padding: 16px; border: 1px solid var(--border); }
+  .compare-box h4 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+
+  /* Flow steps */
+  .flow { display: flex; flex-direction: column; gap: 4px; }
+  .step {
+    display: grid; grid-template-columns: 36px 1fr auto; gap: 10px; align-items: start;
+    padding: 10px 14px; border-radius: 8px; background: var(--surface2); font-size: 12px;
+  }
+  .step .n {
+    width: 28px; height: 28px; border-radius: 6px; display: flex;
+    align-items: center; justify-content: center; font-family: 'JetBrains Mono'; font-weight: 600;
+  }
+  .step h4 { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .step .math { font-family: 'JetBrains Mono'; font-size: 12px; color: var(--math); line-height: 1.7; }
+  .step .shape { font-family: 'JetBrains Mono'; font-size: 11px; color: var(--text2); }
+  .step .meta { text-align: right; font-family: 'JetBrains Mono'; font-size: 11px; white-space: nowrap; }
+  .step .meta .f { color: var(--intf); }
+  .step .meta .p { color: var(--text2); }
+  .arrow { text-align: center; color: #333; font-size: 14px; }
+
+  .n-proj { background: #3b82f620; color: #60a5fa; }
+  .n-wave { background: #0891b220; color: #22d3ee; }
+  .n-attn { background: #dc262620; color: #f87171; }
+  .n-merge { background: #8b5cf620; color: #a78bfa; }
+  .n-ffn { background: #22c55e20; color: #4ade80; }
+
+  /* Badge */
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+  .badge-wave { background: var(--wave); color: #fff; }
+  .badge-attn { background: var(--attn); color: #fff; }
+  .badge-new { background: var(--accent); color: #000; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; }
+  .tab {
+    padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 500;
+    cursor: pointer; background: var(--surface2); border: 1px solid transparent;
+    color: var(--text2); transition: all 0.2s;
+  }
+  .tab:hover { border-color: var(--border); color: var(--text); }
+  .tab.active { background: var(--accent); color: #000; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* Nav */
+  .nav { text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border); }
+  .nav a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  .nav a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+<h1>Wave-Hymba: Parallel Head Architecture</h1>
+<div class="sub">6 wave heads (O(n log n)) + 2 attention heads (O(n&sup2;)) running in parallel within every layer</div>
+
+<!-- ════════════ OVERVIEW ════════════ -->
+<div class="card">
+  <h2>The Key Idea</h2>
+  <div class="desc">Instead of alternating wave and attention LAYERS, run both mechanisms as parallel HEADS within every layer. Every layer gets content-dependent routing.</div>
+
+  <div class="compare">
+    <div class="compare-box">
+      <h4 style="color:var(--text2)">V4.6.0: Layer-level hybrid</h4>
+      <div class="eq" style="margin:8px 0;font-size:12px">
+        L0: <span class="b">all 8 heads wave</span><br>
+        L1: <span class="b">all 8 heads wave</span><br>
+        L2: <span class="b">all 8 heads wave</span><br>
+        L3: <span class="r">all 8 heads attention</span> &larr; only content routing<br>
+        L4: <span class="b">all 8 heads wave</span><br>
+        L5: <span class="b">all 8 heads wave</span><br>
+        L6: <span class="b">all 8 heads wave</span><br>
+        L7: <span class="b">all 8 heads wave</span>
+      </div>
+      <div style="font-size:12px;color:var(--text2)">Content routing at 1/8 layers only</div>
+    </div>
+    <div class="compare-box" style="border-color:var(--accent)40">
+      <h4 style="color:var(--accent)">V4.8: Hymba-style parallel heads <span class="badge badge-new">NEW</span></h4>
+      <div class="eq" style="margin:8px 0;font-size:12px">
+        L0: <span class="b">6 wave</span> + <span class="r">2 attn</span> in parallel<br>
+        L1: <span class="b">6 wave</span> + <span class="r">2 attn</span> in parallel<br>
+        L2: <span class="b">6 wave</span> + <span class="r">2 attn</span> in parallel<br>
+        L3: <span class="b">6 wave</span> + <span class="r">2 attn</span> in parallel<br>
+        L4: <span class="b">6 wave</span> + <span class="r">2 attn</span> in parallel<br>
+        L5: <span class="b">6 wave</span> + <span class="r">2 attn</span> in parallel<br>
+        L6: <span class="b">6 wave</span> + <span class="r">2 attn</span> in parallel<br>
+        L7: <span class="b">6 wave</span> + <span class="r">2 attn</span> in parallel
+      </div>
+      <div style="font-size:12px;color:var(--accent)">Content routing at EVERY layer</div>
+    </div>
+  </div>
+
+  <div class="callout callout-key">
+    <span class="callout-icon">&#9889;</span>
+    <div>
+      <strong>Why parallel &gt; alternating:</strong> NVIDIA's Hymba ablation showed parallel heads beat sequential by
+      <strong>+4.74% recall accuracy</strong> with 13% better throughput. Each layer sees both distance-based patterns
+      (wave) AND content-based routing (attention) simultaneously.
+    </div>
+  </div>
+</div>
+
+<!-- ════════════ DATA FLOW ════════════ -->
+<div class="card">
+  <h2>Single Layer: Complete Data Flow</h2>
+  <div class="desc">Every layer follows this exact pipeline. D=384, H=8 (6 wave + 2 attn), head_dim=48.</div>
+
+  <div class="diagram">
+    <svg width="700" height="520" viewBox="0 0 700 520">
+      <!-- Input -->
+      <rect x="250" y="10" width="200" height="36" rx="8" fill="#1a1a30" stroke="#444" stroke-width="1"/>
+      <text x="350" y="33" text-anchor="middle" fill="#ddd" font-size="13" font-family="Inter">x: (B, 512, 384)</text>
+
+      <!-- Arrow down -->
+      <line x1="350" y1="46" x2="350" y2="62" stroke="#444" stroke-width="1.5"/>
+      <polygon points="345,60 355,60 350,68" fill="#444"/>
+
+      <!-- LayerNorm + QKVG -->
+      <rect x="180" y="70" width="340" height="40" rx="8" fill="#3b82f615" stroke="#3b82f650" stroke-width="1"/>
+      <text x="350" y="86" text-anchor="middle" fill="#60a5fa" font-size="12" font-family="Inter" font-weight="600">LayerNorm + QKVG Projection</text>
+      <text x="350" y="102" text-anchor="middle" fill="#666" font-size="10" font-family="JetBrains Mono">(B,512,384) &rarr; Linear(384,1536) &rarr; [Q,K,V,Gate] each (B,8,512,48)</text>
+
+      <!-- Arrow + Split -->
+      <line x1="350" y1="110" x2="350" y2="126" stroke="#444" stroke-width="1.5"/>
+      <text x="350" y="138" text-anchor="middle" fill="#888" font-size="11" font-family="Inter">split heads: [:6] wave, [6:] attn</text>
+
+      <!-- Two branches -->
+      <line x1="350" y1="144" x2="180" y2="168" stroke="#0891b2" stroke-width="1.5"/>
+      <line x1="350" y1="144" x2="520" y2="168" stroke="#dc2626" stroke-width="1.5"/>
+
+      <!-- Wave branch box -->
+      <rect x="40" y="170" width="280" height="200" rx="12" fill="#0891b208" stroke="#0891b240" stroke-width="1.5"/>
+      <text x="180" y="192" text-anchor="middle" fill="#22d3ee" font-size="13" font-family="Inter" font-weight="700">6 Wave Heads</text>
+      <text x="180" y="206" text-anchor="middle" fill="#0891b2" font-size="10" font-family="Inter">O(n log n)</text>
+
+      <!-- Wave steps -->
+      <text x="60" y="228" fill="#8888a0" font-size="10" font-family="JetBrains Mono">1. &phi;_q(Q), &phi;_k(K)  feature maps</text>
+      <text x="60" y="246" fill="#8888a0" font-size="10" font-family="JetBrains Mono">2. deposit = &phi;_k(K) &odot; V</text>
+      <text x="60" y="264" fill="#8888a0" font-size="10" font-family="JetBrains Mono">3. scatter &rarr; field (6,512,48)</text>
+      <text x="60" y="282" fill="#22d3ee" font-size="10" font-family="JetBrains Mono">4. FFT conv with wave kernel</text>
+      <text x="60" y="300" fill="#22d3ee" font-size="10" font-family="JetBrains Mono">   + SpectralGate (token-0)</text>
+      <text x="60" y="318" fill="#8888a0" font-size="10" font-family="JetBrains Mono">5. coupling (6,6) + gather</text>
+      <text x="60" y="336" fill="#8888a0" font-size="10" font-family="JetBrains Mono">6. cross_dim(q_feat &odot; gathered)</text>
+      <text x="60" y="358" fill="#666" font-size="10" font-family="JetBrains Mono">   &rarr; (B, 6, 512, 48)</text>
+
+      <!-- Attn branch box -->
+      <rect x="380" y="170" width="280" height="200" rx="12" fill="#dc262608" stroke="#dc262640" stroke-width="1.5"/>
+      <text x="520" y="192" text-anchor="middle" fill="#f87171" font-size="13" font-family="Inter" font-weight="700">2 Attention Heads</text>
+      <text x="520" y="206" text-anchor="middle" fill="#dc2626" font-size="10" font-family="Inter">O(n&sup2;)</text>
+
+      <!-- Attn steps -->
+      <text x="400" y="240" fill="#8888a0" font-size="10" font-family="JetBrains Mono">1. scores = Q &middot; K<tspan baseline-shift="super" font-size="8">T</tspan> / &radic;48</text>
+      <text x="400" y="264" fill="#f87171" font-size="10" font-family="JetBrains Mono">2. attn = softmax(scores)</text>
+      <text x="400" y="282" fill="#f87171" font-size="10" font-family="JetBrains Mono">   + causal mask</text>
+      <text x="400" y="306" fill="#8888a0" font-size="10" font-family="JetBrains Mono">3. out = attn @ V</text>
+      <text x="400" y="334" fill="#666" font-size="10" font-family="JetBrains Mono">   &rarr; (B, 2, 512, 48)</text>
+
+      <!-- Converge arrows -->
+      <line x1="180" y1="370" x2="280" y2="400" stroke="#0891b2" stroke-width="1.5"/>
+      <line x1="520" y1="370" x2="420" y2="400" stroke="#dc2626" stroke-width="1.5"/>
+
+      <!-- RMSNorm + Merge -->
+      <rect x="200" y="398" width="300" height="44" rx="8" fill="#8b5cf615" stroke="#8b5cf650" stroke-width="1"/>
+      <text x="350" y="416" text-anchor="middle" fill="#a78bfa" font-size="12" font-family="Inter" font-weight="600">RMSNorm(wave) + RMSNorm(attn)</text>
+      <text x="350" y="434" text-anchor="middle" fill="#666" font-size="10" font-family="JetBrains Mono">concat &rarr; (B, 8, 512, 48) &rarr; &sigma;(Gate) &odot; output</text>
+
+      <!-- Arrow -->
+      <line x1="350" y1="442" x2="350" y2="460" stroke="#444" stroke-width="1.5"/>
+      <polygon points="345,458 355,458 350,466" fill="#444"/>
+
+      <!-- Output proj + FFN -->
+      <rect x="180" y="468" width="340" height="40" rx="8" fill="#22c55e10" stroke="#22c55e40" stroke-width="1"/>
+      <text x="350" y="485" text-anchor="middle" fill="#4ade80" font-size="12" font-family="Inter" font-weight="600">out_proj + Residual + LayerNorm + FFN + Residual</text>
+      <text x="350" y="501" text-anchor="middle" fill="#666" font-size="10" font-family="JetBrains Mono">(B, 512, 384) &rarr; output</text>
+    </svg>
+  </div>
+</div>
+
+<!-- ════════════ MATRIX CALCULATIONS ════════════ -->
+<div class="card">
+  <h2>Matrix Calculations</h2>
+  <div class="desc">Rough FLOP estimates for S1 config. B=16, N=512, D=384, d=48, Hw=6 wave heads, Ha=2 attn heads.</div>
+
+  <div class="tabs">
+    <div class="tab active" onclick="sw(this,'t-proj')">Projection</div>
+    <div class="tab" onclick="sw(this,'t-wave')">Wave Path</div>
+    <div class="tab" onclick="sw(this,'t-attn')">Attn Path</div>
+    <div class="tab" onclick="sw(this,'t-merge')">Merge + FFN</div>
+    <div class="tab" onclick="sw(this,'t-total')">Total Budget</div>
+  </div>
+
+  <div class="tab-content active" id="t-proj">
+    <h3>Shared QKVG Projection</h3>
+    <div class="eq">
+      <span class="label">One matmul produces Q, K, V, Gate for ALL 8 heads</span>
+      [Q, K, V, Gate] = LayerNorm(x) @ W<sub>qkvg</sub> + b<br>
+      <br>
+      W<sub>qkvg</sub>: <span class="hl">(384, 1536)</span> &nbsp; b: (1536,)<br>
+      <br>
+      <span class="dim">// 384 &times; 4 = 1536 (Q:384 + K:384 + V:384 + Gate:384)</span><br>
+      <span class="dim">// Each 384 = 8 heads &times; 48 dims/head</span><br>
+      <br>
+      FLOPs: 2 &times; 512 &times; 384 &times; 1536 = <span class="hl">604M</span><br>
+      Params: 384 &times; 1536 + 1536 = <span class="hl">591,360</span><br>
+      <br>
+      <span class="dim">// After projection, split by head index:</span><br>
+      Q_wave = Q[:, :6, :, :]  <span class="dim">// (B, 6, 512, 48)</span><br>
+      Q_attn = Q[:, 6:, :, :]  <span class="dim">// (B, 2, 512, 48)</span><br>
+      <span class="dim">// Same split for K, V</span>
+    </div>
+  </div>
+
+  <div class="tab-content" id="t-wave">
+    <h3>Wave Field Path (6 heads)</h3>
+    <div class="eq">
+      <span class="label">Step 1: Learned Feature Maps (Hedgehog)</span>
+      Q' = ReLU(W<sub>2</sub> &middot; GELU(W<sub>1</sub> &middot; Q_wave)) + &epsilon;<br>
+      K' = ReLU(W<sub>2</sub> &middot; GELU(W<sub>1</sub> &middot; K_wave)) + &epsilon;<br>
+      <br>
+      <span class="dim">// W1, W2: (48, 48) identity-init, per head</span><br>
+      <span class="dim">// 2 maps &times; 2 layers &times; (48&times;48 + 48) = 9,408 params</span><br>
+      FLOPs: 2 maps &times; 2 layers &times; 512 &times; <span class="b">6</span> &times; 48&sup2; = <span class="hl">56M</span>
+    </div>
+    <div class="eq">
+      <span class="label">Step 2: Deposit + Scatter</span>
+      deposit<sub>j</sub>[d] = K'<sub>j</sub>[d] &times; V<sub>j</sub>[d] <span class="dim">// element-wise</span><br>
+      field[p(j)] += deposit<sub>j</sub> <span class="dim">// scatter_add, stride=1</span><br>
+      <br>
+      field shape: (B, <span class="b">6</span>, 512, 48)<br>
+      FLOPs: ~0.3M <span class="dim">(scatter is index ops, not matmul)</span>
+    </div>
+    <div class="eq">
+      <span class="label">Step 3: FFT Convolution with Wave Kernel</span>
+      <span class="dim">// Kernel per head: k(t) = e<sup>-&alpha;t</sup> cos(&omega;t + &phi;) for t&ge;0</span><br>
+      <span class="dim">// Z-transform: closed-form FFT, no materialization</span><br>
+      <span class="dim">// + SpectralGate: modulates kernel based on token 0's Q</span><br>
+      <br>
+      field_fft = rfft(field, n=2048) <span class="dim">// 4x pad for SpectralGate</span><br>
+      kernel_fft = Z_transform(&alpha;, &omega;, &phi;) &times; (1 + gate(Q<sub>0</sub>))<br>
+      convolved = irfft(field_fft &times; kernel_fft)[:512]<br>
+      <br>
+      <span class="dim">// 3 FFTs &times; 6 heads &times; 48 dims &times; 2048 &times; log(2048)</span><br>
+      FLOPs: <span class="hl">~22M</span> <span class="dim">(with 4x padding for SpectralGate)</span><br>
+      Kernel params: 3 &times; <span class="b">6</span> = <span class="hl">18</span> <span class="dim">(&alpha;, &omega;, &phi; per head)</span><br>
+      SpectralGate params: <span class="hl">~98K</span> <span class="dim">(MLP: 6&times;48 &rarr; 288 &rarr; 6&times;32)</span>
+    </div>
+    <div class="eq">
+      <span class="label">Step 4: Coupling + Gather + Cross-dim</span>
+      coupled<sub>h</sub> = &sum;<sub>h'</sub> softmax(C)<sub>h,h'</sub> &middot; field<sub>h'</sub><br>
+      gathered<sub>i</sub> = coupled[p(i)] <span class="dim">// gather at token positions</span><br>
+      output = W<sub>cross</sub>(Q' &odot; gathered) <span class="dim">// (48,48) linear, identity-init</span><br>
+      <br>
+      C: (<span class="b">6</span>, <span class="b">6</span>) = <span class="hl">36</span> params<br>
+      W<sub>cross</sub>: (48, 48) = <span class="hl">2,304</span> params<br>
+      FLOPs: ~18M<br>
+      <br>
+      wave_output: (B, <span class="b">6</span>, 512, 48)
+    </div>
+  </div>
+
+  <div class="tab-content" id="t-attn">
+    <h3>Standard Attention Path (2 heads)</h3>
+    <div class="eq">
+      <span class="label">Scaled Dot-Product Attention (PyTorch SDPA)</span>
+      scores = Q_attn @ K_attn<sup>T</sup> / &radic;48<br>
+      <br>
+      <span class="dim">// scores shape: (B, <span class="r">2</span>, 512, 512)</span><br>
+      <span class="dim">// This is the O(n&sup2;) part: 512 &times; 512 = 262K weights per head</span><br>
+      <br>
+      attn = softmax(scores + causal_mask)<br>
+      attn_output = attn @ V_attn<br>
+      <br>
+      <span class="dim">// attn_output: (B, <span class="r">2</span>, 512, 48)</span><br>
+      <br>
+      FLOPs:<br>
+      &nbsp; Q@K<sup>T</sup>: 2 &times; 512 &times; 512 &times; 48 &times; <span class="r">2</span> = <span class="hl">50M</span><br>
+      &nbsp; attn@V: 2 &times; 512 &times; 512 &times; 48 &times; <span class="r">2</span> = <span class="hl">50M</span><br>
+      &nbsp; Total: <span class="hl">100M</span><br>
+      <br>
+      Extra params: <span class="hl">0</span> <span class="dim">(Q, K, V come from shared QKVG projection)</span>
+    </div>
+
+    <div class="callout callout-info">
+      <span class="callout-icon">&equiv;</span>
+      <div>2 attention heads use F.scaled_dot_product_attention (PyTorch 2.0+).
+        This auto-selects FlashAttention-2 on GPU. Much faster than manual Q@K softmax@V.</div>
+    </div>
+  </div>
+
+  <div class="tab-content" id="t-merge">
+    <h3>Merge + Gate + FFN</h3>
+    <div class="eq">
+      <span class="label">Per-branch RMSNorm then combine (Hymba-style)</span>
+      <span class="dim">// Wave and attn outputs have different magnitude distributions</span><br>
+      <span class="dim">// RMSNorm each independently before merging</span><br>
+      <br>
+      wave_normed = RMSNorm<sub>wave</sub>(wave_output) <span class="dim">// (B, 6, 512, 48)</span><br>
+      attn_normed = RMSNorm<sub>attn</sub>(attn_output) <span class="dim">// (B, 2, 512, 48)</span><br>
+      combined = concat(wave_normed, attn_normed) <span class="dim">// (B, 8, 512, 48)</span><br>
+      <br>
+      <span class="dim">// Content-dependent gating (from QKVG projection)</span><br>
+      output = &sigma;(Gate) &odot; combined <span class="dim">// Gate bias=2.0, starts open</span><br>
+      output = reshape(output) <span class="dim">// (B, 512, 384)</span><br>
+      <br>
+      RMSNorm params: 2 &times; 48 = <span class="hl">96</span><br>
+      FLOPs: ~0.2M
+    </div>
+    <div class="eq">
+      <span class="label">Output Projection + Residual</span>
+      x = x + Dropout(W<sub>out</sub> @ output + b)<br>
+      W<sub>out</sub>: (384, 384) = <span class="hl">147,840</span> params<br>
+      FLOPs: 2 &times; 512 &times; 384&sup2; = <span class="hl">151M</span>
+    </div>
+    <div class="eq">
+      <span class="label">Feed-Forward Network</span>
+      x = x + W<sub>down</sub> &middot; GELU(W<sub>up</sub> &middot; LayerNorm(x) + b<sub>up</sub>) + b<sub>down</sub><br>
+      W<sub>up</sub>: (384, 1536) &nbsp; W<sub>down</sub>: (1536, 384)<br>
+      Params: <span class="hl">1,181,568</span><br>
+      FLOPs: 2 &times; 512 &times; 384 &times; 1536 &times; 2 = <span class="hl">1,208M</span>
+    </div>
+  </div>
+
+  <div class="tab-content" id="t-total">
+    <h3>Full Layer Budget: Wave-Hymba vs V4.6.0 vs Standard</h3>
+    <table>
+      <thead>
+        <tr><th>Component</th><th>Wave-Hymba</th><th>V4.6.0 Wave Layer</th><th>Standard Attn</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>QKVG / QKV projection</td>
+          <td class="mono">591K / 604M</td>
+          <td class="mono">591K / 604M</td>
+          <td class="mono">443K / 453M</td>
+        </tr>
+        <tr>
+          <td>Feature maps (Q+K)</td>
+          <td class="mono">9.4K / 56M</td>
+          <td class="mono">9.4K / 75M</td>
+          <td class="mono">- / -</td>
+        </tr>
+        <tr>
+          <td>FFT convolution</td>
+          <td class="mono">18 + 98K<sup>SG</sup> / 22M</td>
+          <td class="mono">24 + 131K<sup>SG</sup> / 12M</td>
+          <td class="mono">- / -</td>
+        </tr>
+        <tr>
+          <td>Attention (Q@K, attn@V)</td>
+          <td class="mono"><span class="good">0 / 100M</span> (2 heads)</td>
+          <td class="mono">- / -</td>
+          <td class="mono">0 / 402M (8 heads)</td>
+        </tr>
+        <tr>
+          <td>Coupling + cross_dim</td>
+          <td class="mono">2.3K / 18M</td>
+          <td class="mono">2.4K / 22M</td>
+          <td class="mono">- / -</td>
+        </tr>
+        <tr>
+          <td>Merge (RMSNorm &times;2)</td>
+          <td class="mono"><span class="good">96 / 0.2M</span></td>
+          <td class="mono">- / -</td>
+          <td class="mono">- / -</td>
+        </tr>
+        <tr>
+          <td>Output projection</td>
+          <td class="mono">148K / 151M</td>
+          <td class="mono">148K / 151M</td>
+          <td class="mono">148K / 151M</td>
+        </tr>
+        <tr>
+          <td>FFN</td>
+          <td class="mono">1,182K / 1,208M</td>
+          <td class="mono">1,182K / 1,208M</td>
+          <td class="mono">1,182K / 1,208M</td>
+        </tr>
+        <tr style="border-top:2px solid var(--border);font-weight:600">
+          <td>TOTAL per layer</td>
+          <td class="mono"><span class="good">~2.03M / 2,159M</span></td>
+          <td class="mono">1.93M / 2,073M</td>
+          <td class="mono">1.77M / 2,215M</td>
+        </tr>
+        <tr style="font-weight:600">
+          <td>TOTAL model (8 layers + embed + intf)</td>
+          <td class="mono"><span class="good">~20.6M</span></td>
+          <td class="mono">19.7M (7W+1A)</td>
+          <td class="mono">17.5M (8A)</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout callout-info">
+      <span class="callout-icon">&equiv;</span>
+      <div>
+        <strong>Wave-Hymba adds ~100M FLOPs/layer</strong> (the 2-head attention path) on top of pure wave.
+        That's +4.8% compute per layer. But every layer now has content-dependent routing, not just L3.
+        Total model FLOPs: ~17.3G (vs 16.6G pure wave, vs 17.7G pure standard).
+      </div>
+    </div>
+
+    <h3 style="margin-top:24px">Attention FLOPs: Hymba vs V4.6.0</h3>
+    <div class="compare">
+      <div class="compare-box">
+        <h4 style="color:var(--text2)">V4.6.0: 1 full attn layer at L3</h4>
+        <div class="eq" style="font-size:11px;margin:4px 0">
+          7 wave layers: 0 attn FLOPs<br>
+          1 attn layer: 402M FLOPs (8 heads)<br>
+          <strong>Total attn: 402M</strong>
+        </div>
+      </div>
+      <div class="compare-box">
+        <h4 style="color:var(--accent)">Hymba: 2 attn heads &times; 8 layers</h4>
+        <div class="eq" style="font-size:11px;margin:4px 0">
+          8 layers &times; 100M = 800M FLOPs<br>
+          <strong>Total attn: 800M</strong> (2&times; more)<br>
+          But: <span class="good">spread across ALL layers</span>
+        </div>
+      </div>
+    </div>
+    <div style="font-size:12px;color:var(--text2);margin-top:8px">
+      Hymba uses 2&times; more attention FLOPs but distributes them across every layer.
+      The question is whether "a little routing everywhere" beats "a lot of routing at one point."
+      NVIDIA's data says yes: parallel &gt; concentrated.
+    </div>
+  </div>
+</div>
+
+<!-- ════════════ WHY THIS WORKS ════════════ -->
+<div class="card">
+  <h2>Why Parallel Heads Should Close the Gap</h2>
+
+  <h3>Your eval data says the gap is EVERYWHERE</h3>
+  <div class="eq">
+    <span class="label">Per-position PPL gap (from full_eval)</span>
+    Position 0-10:    <span class="bad">1.61x</span><br>
+    Position 10-50:   <span class="bad">1.65x</span><br>
+    Position 50-128:  <span class="bad">1.67x</span><br>
+    Position 128-256: <span class="bad">1.68x</span><br>
+    Position 256-512: <span class="bad">1.69x</span><br>
+    <br>
+    <span class="dim">// Uniform gap = wave fails at content routing everywhere.</span><br>
+    <span class="dim">// V4.6.0 puts attention at L3 only &rarr; fixes routing once.</span><br>
+    <span class="hl">// Hymba puts attention at EVERY layer &rarr; continuous routing.</span>
+  </div>
+
+  <h3>Repeated token retrieval degrades with distance</h3>
+  <div class="eq">
+    <span class="label">Repetition gap by distance</span>
+    Distance 1-5:     gap = 0.183  <span class="good">&larr; wave almost works</span><br>
+    Distance 5-20:    gap = 0.268<br>
+    Distance 20-50:   gap = 0.433  <span class="bad">&larr; failing</span><br>
+    Distance 50-128:  gap = 0.517<br>
+    Distance 128-512: gap = 0.571  <span class="bad">&larr; worst</span><br>
+    <br>
+    <span class="dim">// 2 attention heads per layer maintain a (2,48) KV state.</span><br>
+    <span class="dim">// This provides associative recall that wave kernels can't.</span><br>
+    <span class="dim">// At distance 128+, the attention heads are the ONLY mechanism</span><br>
+    <span class="dim">// that can match "this token was seen before."</span>
+  </div>
+
+  <h3>NVIDIA's ablation data (300M model)</h3>
+  <table>
+    <thead><tr><th>Config</th><th>Commonsense</th><th>Recall</th><th>Throughput</th></tr></thead>
+    <tbody>
+      <tr><td>SSM only (Mamba)</td><td>42.98%</td><td>19.23%</td><td>4,721 tok/s</td></tr>
+      <tr><td>+ Sequential attention (alternating layers)</td><td>44.07%</td><td>45.16%</td><td>776 tok/s</td></tr>
+      <tr><td class="good"><strong>+ Parallel heads (Hymba)</strong></td><td class="good"><strong>45.19%</strong></td><td class="good"><strong>49.90%</strong></td><td class="good"><strong>877 tok/s</strong></td></tr>
+      <tr><td>+ Sliding window + global attn</td><td>44.56%</td><td>48.79%</td><td>2,400 tok/s</td></tr>
+      <tr><td>+ KV sharing + meta tokens</td><td>45.59%</td><td>51.79%</td><td>2,696 tok/s</td></tr>
+    </tbody>
+  </table>
+  <div style="font-size:12px;color:var(--text2);margin-top:8px">
+    Parallel beats sequential by +1.12% commonsense, +4.74% recall, with 13% better throughput.
+  </div>
+</div>
+
+<!-- ════════════ WHAT'S NEXT ════════════ -->
+<div class="card">
+  <h2>Future: Beyond Hymba</h2>
+  <div class="desc">If Hymba-style parallel heads work, these are the next levers.</div>
+
+  <table>
+    <thead><tr><th>Enhancement</th><th>What it does</th><th>Cost</th><th>Expected impact</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Meta tokens</strong></td>
+        <td>128 learnable embeddings prepended to every sequence, always visible</td>
+        <td>128 &times; 384 = 49K params</td>
+        <td>+3% recall (Hymba paper)</td>
+      </tr>
+      <tr>
+        <td><strong>SwiGLU FFN</strong></td>
+        <td>gate &middot; up projection instead of GELU</td>
+        <td>0 extra params (iso-param)</td>
+        <td>~1-3% PPL</td>
+      </tr>
+      <tr>
+        <td><strong>Low-rank correction</strong></td>
+        <td>rank-4 linear attention added to wave path</td>
+        <td>+3K params/layer</td>
+        <td>Targets long-distance recall specifically</td>
+      </tr>
+      <tr>
+        <td><strong>Delta-rule scan</strong></td>
+        <td>Error-correcting recurrence on FFT output</td>
+        <td>+d&sup2; params/layer</td>
+        <td>DeltaNet achieves 0.97x gap</td>
+      </tr>
+      <tr>
+        <td><strong>Kill interference</strong></td>
+        <td>Remove 1.33M params, redirect to wider FFN</td>
+        <td>-1.33M (net saving)</td>
+        <td>Hymba provides global context; interference redundant</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="nav">
+  <a href="layer_diagram.html">&larr; Full layer diagram</a>
+</div>
+
+</div><!-- page -->
+
+<script>
+function sw(el, id) {
+  const card = el.closest('.card');
+  card.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  card.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById(id).classList.add('active');
+}
+</script>
+</body>
+</html>

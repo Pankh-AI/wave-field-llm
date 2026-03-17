@@ -2,7 +2,7 @@
 Wave Field LLM - Physics-Based Language Model with Wave Field Dynamics
 """
 
-__version__ = "4.7.1"
+__version__ = "4.6.1b"
 
 from .global_context import GlobalContextModule
 from .wave_field_attention import WaveFieldAttention

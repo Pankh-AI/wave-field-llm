@@ -42,7 +42,7 @@ services:
       - DATASET=2
       - LOCAL_WINDOW=64
 
-  # S1-Hybrid: V5.0 hybrid — 1 standard attention layer at L3 (~25 min on 3060)
+  # S1-Hybrid: 1 dedicated standard attention at L3, SpectralGate ON (~15 min)
   s1-hybrid:
     build: .
     container_name: wave-s1-hybrid
@@ -63,6 +63,63 @@ services:
       - SCALE=S1
       - DATASET=2
       - HYBRID_LAYERS=3
+      - SPECTRAL_GATE=1
+      - USE_CHECKPOINT=0
+      - MODEL=wave
+
+  # S1-Delta: V4.6.0 + additive delta-rule correction in wave layers (~15 min)
+  s1-delta:
+    build: .
+    container_name: wave-s1-delta
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_scaling.py
+      - SCALE=S1
+      - DATASET=2
+      - HYBRID_LAYERS=3
+      - SPECTRAL_GATE=1
+      - DELTA_CORRECTION=1
+      - TORCH_COMPILE=0
+      - USE_CHECKPOINT=0
+      - MODEL=wave
+
+  # S1-2K: same params as S1 but seq=2048 — where O(n log n) matters (~30 min)
+  s1-2k:
+    build: .
+    container_name: wave-s1-2k
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_scaling.py
+      - SCALE=S1-2K
+      - DATASET=2
+      - HYBRID_LAYERS=3
+      - SPECTRAL_GATE=1
+      - KERNEL_LR_MULT=15.0
+      - USE_CHECKPOINT=0
+      - MONITOR_SNAPSHOTS=3
+      - MODEL=standard
 
   # S1+GLA: 22M params, 20M tokens, GLA at L3+L7 with weight sharing (~25 min)
   s1-gla:

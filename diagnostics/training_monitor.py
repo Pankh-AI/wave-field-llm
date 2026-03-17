@@ -142,7 +142,7 @@ class WaveFieldMonitor:
         """What frequencies/dampings has each head learned?
         Are they diverse or collapsed to same values?"""
         diag = {}
-        H = attn.num_heads
+        H = getattr(attn, 'n_wave_heads', attn.num_heads)
         G = attn.field_size
 
         freq = attn.wave_frequency.data.cpu()      # (H,) or (H, C)
@@ -313,7 +313,7 @@ class WaveFieldMonitor:
         # Field coupling matrix
         coupling = F.softmax(attn.field_coupling.data, dim=-1)
         # How far from identity? (measures cross-head mixing strength)
-        identity = torch.eye(attn.num_heads, device=coupling.device)
+        identity = torch.eye(coupling.shape[0], device=coupling.device)
         diag[f'{prefix}_coupling_deviation'] = (coupling - identity).norm().item()
         # Entropy of coupling (high = more mixing, low = independent heads)
         coupling_entropy = -(coupling * (coupling + 1e-10).log()).sum(dim=1).mean()

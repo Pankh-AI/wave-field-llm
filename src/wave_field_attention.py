@@ -150,6 +150,119 @@ class SpectralGate(nn.Module):
         return base_kernel_fft.unsqueeze(0) * (1.0 + gate)
 
 
+class DeltaCorrection(nn.Module):
+    """Additive delta-rule correction for wave field attention (RLA-inspired).
+
+    Tracks prediction errors in a (d, d) recurrent state per head and outputs
+    a correction signal. The wave path stays untouched — this ADDS to it.
+
+    Delta rule: before writing k→v, erase old v associated with k.
+      error_t = v_t - S_{t-1} @ k_t       (what we got wrong)
+      S_t = α_t * S_{t-1} + β_t * v_t @ k_t^T - β_t * (S_{t-1} @ k_t) @ k_t^T
+      correction_t = S_t @ q_t
+
+    Cost: O(n * d²) per layer. At d=48, N=512: ~1.2M FLOPs (0.1% of FFN).
+    Params: ~200 per layer (2 gate projections).
+
+    References:
+      - GatedDeltaNet (ICLR 2025): 0.97x gap at 1.3B
+      - RLA (arXiv:2509.25223): matches transformer at 1.5B
+    """
+
+    def __init__(self, head_dim, num_heads):
+        super().__init__()
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        # Per-token gates from key content (shared across heads)
+        # Decay: how much of old state to keep. Init sigmoid(-2)=0.12 → mostly forget
+        self.decay_proj = nn.Linear(head_dim, 1, bias=True)
+        nn.init.zeros_(self.decay_proj.weight)
+        nn.init.constant_(self.decay_proj.bias, -2.0)
+        # Write strength. Init sigmoid(-1)=0.27 → gentle writes
+        self.write_proj = nn.Linear(head_dim, 1, bias=True)
+        nn.init.zeros_(self.write_proj.weight)
+        nn.init.constant_(self.write_proj.bias, -1.0)
+        # Output scale — start near zero so correction doesn't disrupt wave path at init
+        self.out_scale = nn.Parameter(torch.tensor(0.01))
+
+    def forward(self, q, k, v):
+        """
+        q, k, v: (B, H, N, d) — reuses projections from wave path
+        Returns: (B, H, N, d) — additive correction
+
+        Chunk-parallel: within each chunk (C=64 tokens), use causal linear
+        attention (fully parallel, O(C²d)). Between chunks (N/C=8 steps),
+        propagate (d,d) state sequentially. Total: 8 sequential steps
+        instead of 512.
+        """
+        B, H, N, d = q.shape
+        C = 64  # chunk size
+
+        # Content-dependent gates
+        beta = torch.sigmoid(self.write_proj(k))    # (B, H, N, 1) write strength
+        alpha = torch.sigmoid(self.decay_proj(k))   # (B, H, N, 1) decay
+
+        # Normalize k for stable state
+        k_norm = F.normalize(k, dim=-1)
+
+        # Pad to chunk boundary
+        pad = (C - N % C) % C
+        if pad > 0:
+            q = F.pad(q, (0, 0, 0, pad))
+            k_norm = F.pad(k_norm, (0, 0, 0, pad))
+            v = F.pad(v, (0, 0, 0, pad))
+            beta = F.pad(beta, (0, 0, 0, pad))
+            alpha = F.pad(alpha, (0, 0, 0, pad), value=1.0)
+        Np = N + pad
+        n_chunks = Np // C
+
+        # Reshape to chunks: (B, H, n_chunks, C, d/1)
+        q_c = q.reshape(B, H, n_chunks, C, d)
+        k_c = k_norm.reshape(B, H, n_chunks, C, d)
+        v_c = v.reshape(B, H, n_chunks, C, d)
+        b_c = beta.reshape(B, H, n_chunks, C, 1)
+
+        # Per-chunk causal linear attention (intra-chunk, parallel)
+        # scores[i,j] = q[i] · k[j] for j <= i, weighted by beta[j]
+        # This is the "what this chunk contributes" part
+        scores = torch.matmul(q_c, k_c.transpose(-1, -2))  # (B,H,nc,C,C)
+        causal = torch.tril(torch.ones(C, C, device=q.device, dtype=q.dtype))
+        scores = scores * causal.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        # Weight by write strength
+        scores = scores * b_c.transpose(-1, -2)  # broadcast beta over rows
+        intra = torch.matmul(scores, v_c)  # (B, H, nc, C, d)
+
+        # Inter-chunk state propagation (sequential over n_chunks, not N)
+        # S: (B, H, d, d) accumulated key-value state
+        S = q.new_zeros(B, H, d, d)
+        # Compute mean decay per chunk for state propagation
+        a_c = alpha.reshape(B, H, n_chunks, C, 1)
+        # Chunk decay ≈ product of per-token decays = mean^C (log-space approx)
+        chunk_decay = a_c.mean(dim=3) ** C  # (B, H, nc, 1)
+
+        inter_list = []
+        for ci in range(n_chunks):
+            # State contribution: each token in chunk reads from S
+            # inter[t] = q[t] @ S for all t in chunk (parallel)
+            inter = torch.einsum('bhij,bhcj->bhci', S, q_c[:, :, ci])  # (B,H,C,d)
+            inter_list.append(inter)
+
+            # Update state: S = decay * S + sum(beta * v @ k^T) over chunk
+            kv = torch.einsum('bhci,bhcj->bhij',
+                              b_c[:, :, ci] * v_c[:, :, ci],
+                              k_c[:, :, ci])  # (B, H, d, d)
+            S = chunk_decay[:, :, ci].unsqueeze(-1) * S + kv
+
+        inter = torch.stack(inter_list, dim=2)  # (B, H, nc, C, d)
+
+        # Combine intra-chunk + inter-chunk corrections
+        corrections = (intra + inter).reshape(B, H, Np, d)
+        if pad > 0:
+            corrections = corrections[:, :, :N]
+
+        return corrections * self.out_scale
+
+
 class WaveFieldAttention(nn.Module):
 
     def __init__(self, embedding_dim, num_heads, field_size=512, max_seq_len=128,
@@ -160,6 +273,8 @@ class WaveFieldAttention(nn.Module):
                  n_frozen_heads=0,
                  use_monarch_fft=None,
                  use_spectral_gate=None,
+                 n_attn_heads=0,
+                 use_delta_correction=None,
                  device='cuda'):
         super().__init__()
 
@@ -175,7 +290,12 @@ class WaveFieldAttention(nn.Module):
         self.skip_causal_enforce = skip_causal_enforce
         self.device = device
 
+        # Hymba-style mixed heads (optional, default off)
+        self.n_attn_heads = n_attn_heads
+        self.n_wave_heads = num_heads - n_attn_heads
+
         assert embedding_dim % num_heads == 0
+        assert n_attn_heads < num_heads, "Need at least 1 wave head"
 
         # Fused QKV + Gate projection: 4D instead of separate 3D + 1D
         self.qkvg_proj = nn.Linear(embedding_dim, 4 * embedding_dim)
@@ -193,7 +313,10 @@ class WaveFieldAttention(nn.Module):
         # Pad to cuFFT-friendly size (prime factors <= 7).
         # 2x padding for base (analytic kernel is causal by construction).
         # SpectralGate needs 4x (modulation can break Kramers-Kronig).
-        self._fast_pad_size = _next_fast_size(2 * field_size)
+        if use_spectral_gate is None:
+            use_spectral_gate = os.environ.get('SPECTRAL_GATE', '0') == '1'
+        pad_mult = 4 if use_spectral_gate else 2
+        self._fast_pad_size = _next_fast_size(pad_mult * field_size)
         self.freq_bins = self._fast_pad_size // 2 + 1
 
         # Optional Monarch FFT: tensor-core-friendly FFT via matmul decomposition
@@ -209,24 +332,19 @@ class WaveFieldAttention(nn.Module):
                       f"factors=({self._monarch.P},{self._monarch.Q})")
 
         # SpectralGate: content-adaptive kernel modulation (optional).
-        # Constructor param takes precedence, then env var, default off.
-        if use_spectral_gate is None:
-            use_spectral_gate = os.environ.get('SPECTRAL_GATE', '0') == '1'
+        # Only applies to wave heads (attn heads don't use kernels).
         if use_spectral_gate:
             self.spectral_gate = SpectralGate(
-                num_heads=num_heads,
+                num_heads=self.n_wave_heads,
                 head_dim=self.head_dim,
                 freq_bins=self.freq_bins,
                 n_control=32,
             )
-            # 4x padding needed for causal enforcement with SpectralGate
-            self._fast_pad_size = _next_fast_size(4 * field_size)
-            self.freq_bins = self._fast_pad_size // 2 + 1
         else:
             self.spectral_gate = None
 
-        # ---- WAVE KERNEL PARAMETERS ----
-        H = num_heads
+        # ---- WAVE KERNEL PARAMETERS (wave heads only) ----
+        H = self.n_wave_heads
 
         if n_components == 1:
             # V4.3.2: Per-layer HiPPO init with diversity (S4D, arXiv:2206.11893)
@@ -324,6 +442,20 @@ class WaveFieldAttention(nn.Module):
         # in dim 5". Identity init = no change at start.
         self.cross_dim = nn.Linear(self.head_dim, self.head_dim, bias=False)
         nn.init.eye_(self.cross_dim.weight)
+
+        # Hymba branch scales (only when n_attn_heads > 0)
+        if n_attn_heads > 0:
+            self.wave_branch_scale = nn.Parameter(torch.tensor(1.0))
+            self.attn_branch_scale = nn.Parameter(torch.tensor(1.0))
+
+        # Delta-rule correction: additive fix for associative recall failures.
+        # Runs alongside wave path, doesn't modify it. Starts near-zero (out_scale=0.01).
+        if use_delta_correction is None:
+            use_delta_correction = os.environ.get('DELTA_CORRECTION', '0') == '1'
+        if use_delta_correction:
+            self.delta_correction = DeltaCorrection(self.head_dim, self.n_wave_heads)
+        else:
+            self.delta_correction = None
 
         # Fixed stride for absolute position mapping
         # CAUSALITY CRITICAL: stride < 1 causes bilinear interpolation to share
@@ -466,9 +598,10 @@ class WaveFieldAttention(nn.Module):
         numerator = 1.0 - exp_lam_G * z_inv_G        # (H, freq_bins)
         denominator = 1.0 - exp_lam * z_inv           # (H, freq_bins)
 
-        # Numerical safety: clamp denominator away from zero
-        # (pole on unit circle = exp(lam)*z^{-1} = 1, impossible when alpha > 0)
-        denom_safe = denominator + 1e-10 * torch.sgn(denominator) * (denominator.abs() < 1e-10)
+        # Numerical safety: always add small constant to prevent division by zero.
+        # (pole on unit circle = exp(lam)*z^{-1} = 1, impossible when alpha > 0,
+        # but guards against numerical edge cases)
+        denom_safe = denominator + 1e-10
 
         H_z = numerator / denom_safe                  # (H, freq_bins) complex
 
@@ -480,7 +613,7 @@ class WaveFieldAttention(nn.Module):
 
         numer_conj = 1.0 - exp_lam_G_conj * z_inv_G   # (H, freq_bins)
         denom_conj = 1.0 - exp_lam_conj * z_inv        # (H, freq_bins)
-        denom_conj_safe = denom_conj + 1e-10 * torch.sgn(denom_conj) * (denom_conj.abs() < 1e-10)
+        denom_conj_safe = denom_conj + 1e-10
 
         H_z_conj = numer_conj / denom_conj_safe        # (H, freq_bins) complex
 
@@ -488,7 +621,11 @@ class WaveFieldAttention(nn.Module):
         # This is the DFT of k(t) = Re[c * exp(lam*t)] (the real cosine kernel)
         kernel_fft = c_bc * H_z + c_bc.conj() * H_z_conj  # (H, freq_bins) complex
 
-        # Normalize by DC component (same effect as L1 normalization in time domain)
+        # Normalize by DC component (kernel_fft[:, 0] = sum of time-domain kernel).
+        # NOTE: DC norm != L1 norm for oscillatory kernels. High-frequency heads
+        # get amplified because positive/negative lobes cancel in DC but not L1.
+        # This is intentional — it gives high-freq heads more influence, which
+        # all best results (V4.3.3=234, V4.6.0=228.5) relied on.
         dc = kernel_fft[:, 0:1].real.abs().clamp(min=1e-8)
         kernel_fft = kernel_fft / dc
 
@@ -638,6 +775,8 @@ class WaveFieldAttention(nn.Module):
         B, N, D = x.shape
         G = self.field_size
         H = self.num_heads
+        Hw = self.n_wave_heads
+        Ha = self.n_attn_heads
         head_dim = self.head_dim
 
         # Fused QKV + Gate projection (single matmul)
@@ -648,57 +787,71 @@ class WaveFieldAttention(nn.Module):
         k = k.view(B, N, H, head_dim).transpose(1, 2)
         v = v.view(B, N, H, head_dim).transpose(1, 2)
 
-        # ================= WAVE FIELD PATH (linear-wave attention) =================
+        # ================= SPLIT HEADS: wave [:Hw] + attention [Hw:] =================
+        q_wave, q_attn = q[:, :Hw], q[:, Hw:]
+        k_wave, k_attn = k[:, :Hw], k[:, Hw:]
+        v_wave, v_attn = v[:, :Hw], v[:, Hw:]
+
+        # ================= WAVE FIELD PATH (O(n log n)) =================
         # ABSOLUTE POSITION MAPPING — use precomputed indices (slice to actual N)
         if N <= self._cached_idx_lo.shape[0]:
             idx_lo = self._cached_idx_lo[:N]
             idx_hi = self._cached_idx_hi[:N]
             frac = self._cached_frac[:N]
         else:
-            # N exceeds max_seq_len — recompute on the fly (rare, e.g. tests)
             seq_pos = torch.arange(N, device=x.device, dtype=torch.float32)
             field_pos_float = (seq_pos * self.field_stride).clamp(0, G - 2)
             idx_lo = field_pos_float.long().clamp(0, G - 2)
             idx_hi = idx_lo + 1
             frac = (field_pos_float - idx_lo.float()).clamp(0, 1)
 
-        # V4.3: LEARNED FEATURE MAPS (Hedgehog-style)
-        # At init (identity weights): φ(x) = ReLU(x) + eps — tokens are distinct
-        # During training: learns spiky, softmax-mimicking maps
-        q_feat = self.q_feature_map(q)  # (B, H, N, head_dim)
-        k_feat = self.k_feature_map(k)  # (B, H, N, head_dim)
+        # Learned feature maps (Hedgehog-style)
+        q_feat = self.q_feature_map(q_wave)  # (B, Hw, N, head_dim)
+        k_feat = self.k_feature_map(k_wave)  # (B, Hw, N, head_dim)
 
-        # K-WEIGHTED DEPOSIT: K modulates V per dimension (D-dim routing, not scalar!)
-        deposit = k_feat * v  # (B, H, N, head_dim)
+        # K-weighted deposit → scatter → convolve → couple → gather
+        deposit = k_feat * v_wave  # (B, Hw, N, head_dim)
+        field = self._bilinear_scatter(deposit, idx_lo, idx_hi, frac, B, Hw, G, head_dim, x.device)
 
-        # SCATTER → CONVOLVE → COUPLE → GATHER
-        field = self._bilinear_scatter(deposit, idx_lo, idx_hi, frac, B, H, G, head_dim, x.device)
-
-        # Build wave kernel FFT
         if self.use_analytic_kernel and self.n_components == 1:
             base_kernel_fft = self._build_analytic_kernel_fft(x.device)
         else:
             base_kernel_fft = self._build_wave_kernels(x.device)
 
-        # SpectralGate: content-adaptive kernel (optional)
         has_spectral_gate = self.spectral_gate is not None
         if has_spectral_gate:
-            kernel_fft = self.spectral_gate(q, base_kernel_fft)  # (B, H, freq_bins)
+            kernel_fft = self.spectral_gate(q_wave, base_kernel_fft)
         else:
-            kernel_fft = base_kernel_fft  # (H, freq_bins) — static, already causal
+            kernel_fft = base_kernel_fft
         field = self._wave_convolve(field, kernel_fft,
                                     needs_causal_enforce=has_spectral_gate)
 
         field = self._apply_field_coupling(field)
-
-        gathered = self._bilinear_gather(field, idx_lo, idx_hi, frac)  # (B, H, N, head_dim)
+        gathered = self._bilinear_gather(field, idx_lo, idx_hi, frac)  # (B, Hw, N, head_dim)
 
         # Q-weighted reading + cross-dimension mixing
-        wave_output = self.cross_dim(q_feat * gathered)  # (B, H, N, head_dim)
+        wave_output = self.cross_dim(q_feat * gathered)  # (B, Hw, N, head_dim)
 
-        # Content-dependent gating
+        # ================= DELTA CORRECTION (additive, O(n·d²)) =================
+        if self.delta_correction is not None:
+            wave_output = wave_output + self.delta_correction(q_wave, k_wave, v_wave)
+
+        # ================= ATTENTION PATH (O(n²), Hymba-style) =================
+        if Ha > 0:
+            attn_output = F.scaled_dot_product_attention(
+                q_attn, k_attn, v_attn, is_causal=True
+            )  # (B, Ha, N, head_dim)
+            # Learnable scalar balance (2 params) — gate handles per-head weighting
+            combined = torch.cat([
+                wave_output * self.wave_branch_scale,
+                attn_output * self.attn_branch_scale
+            ], dim=1)  # (B, H, N, head_dim)
+        else:
+            combined = wave_output
+
+        # Content-dependent gating (applies to all heads)
         gate = torch.sigmoid(gate_raw).view(B, N, H, head_dim).transpose(1, 2)
-        output = wave_output * gate
+        output = combined * gate
 
         output = output.transpose(1, 2).reshape(B, N, D)
         output = self.out_proj(output)

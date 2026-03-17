@@ -73,6 +73,7 @@ class WaveFieldTransformerLayer(nn.Module):
                  skip_causal_enforce=False,
                  n_frozen_heads=0,
                  use_spectral_gate=None,
+                 n_attn_heads=0,
                  device='cuda'):
         super().__init__()
 
@@ -89,6 +90,7 @@ class WaveFieldTransformerLayer(nn.Module):
             skip_causal_enforce=skip_causal_enforce,
             n_frozen_heads=n_frozen_heads,
             use_spectral_gate=use_spectral_gate,
+            n_attn_heads=n_attn_heads,
             device=device
         )
         
@@ -224,9 +226,11 @@ class WaveFieldTransformer(nn.Module):
                  skip_causal_enforce=False,
                  n_frozen_heads=0,
                  use_spectral_gate=None,
+                 n_attn_heads=0,
                  hybrid_attention_layers=None,
                  gla_layers=None):
         super().__init__()
+        self.n_attn_heads = n_attn_heads
 
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
@@ -238,6 +242,7 @@ class WaveFieldTransformer(nn.Module):
         self._hybrid_indices = set(hybrid_attention_layers or [])
         self._gla_indices = set(gla_layers or [])
         self._gla_shared_source = {}  # track which GLA layers share weights
+        self._hybrid_shared_source = {}  # track which hybrid layers share weights
         self.device = device if device is not None else (
             'cuda' if torch.cuda.is_available() else 'cpu'
         )
@@ -254,6 +259,7 @@ class WaveFieldTransformer(nn.Module):
         # GLA layers for layers in gla_layers (with Zamba2 weight sharing).
         self.layers = nn.ModuleList()
         self._gla_source_layer = None
+        self._hybrid_source_layer = None
         for layer_idx in range(num_layers):
             if layer_idx in self._gla_indices:
                 if GLALayer is None:
@@ -272,11 +278,18 @@ class WaveFieldTransformer(nn.Module):
                     self.layers.append(self._gla_source_layer)
                     self._gla_shared_source[layer_idx] = True
             elif layer_idx in self._hybrid_indices:
-                self.layers.append(nn.TransformerEncoderLayer(
-                    d_model=embedding_dim, nhead=num_heads,
-                    dim_feedforward=ffn_dim, dropout=dropout,
-                    activation='gelu', batch_first=True, norm_first=True
-                ))
+                if self._hybrid_source_layer is None:
+                    attn_layer = nn.TransformerEncoderLayer(
+                        d_model=embedding_dim, nhead=num_heads,
+                        dim_feedforward=ffn_dim, dropout=dropout,
+                        activation='gelu', batch_first=True, norm_first=True
+                    )
+                    self._hybrid_source_layer = attn_layer
+                    self.layers.append(attn_layer)
+                else:
+                    # Zamba2-style weight sharing: reuse first hybrid layer's params
+                    self.layers.append(self._hybrid_source_layer)
+                    self._hybrid_shared_source[layer_idx] = True
             else:
                 self.layers.append(WaveFieldTransformerLayer(
                     embedding_dim=embedding_dim,
@@ -293,6 +306,7 @@ class WaveFieldTransformer(nn.Module):
                     skip_causal_enforce=skip_causal_enforce,
                     n_frozen_heads=n_frozen_heads,
                     use_spectral_gate=use_spectral_gate,
+                    n_attn_heads=n_attn_heads,
                     device=self.device
                 ))
         
@@ -435,8 +449,11 @@ class WaveFieldTransformer(nn.Module):
                     self.layers[i] = compiled_gla
                 continue
             if i in self._hybrid_indices:
-                # Standard TransformerEncoderLayer — compile the whole thing
-                self.layers[i] = torch.compile(layer, mode=mode)
+                if i not in self._hybrid_shared_source:
+                    compiled_hybrid = torch.compile(layer, mode=mode)
+                    self.layers[i] = compiled_hybrid
+                else:
+                    self.layers[i] = compiled_hybrid
                 continue
             layer.ffn = torch.compile(layer.ffn, mode=mode)
             layer.norm1 = torch.compile(layer.norm1, mode=mode)

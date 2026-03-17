@@ -160,6 +160,19 @@ SCALE_CONFIGS = {
         'peak_lr': 3e-4,
         'use_checkpoint': True,   # 6GB laptop GPU needs checkpoint with monitor+saves
     },
+    'S1-2K': {
+        'name': 'S1-2K (22M / 20M tok / seq=2048)',
+        'embedding_dim': 384,
+        'num_layers': 8,
+        'num_heads': 8,
+        'ffn_dim': 1536,
+        'field_size': 2048,
+        'seq_len': 2048,
+        'batch_size': 4,    # 6GB VRAM: 4 × 2048 ≈ same memory as 16 × 512
+        'token_budget': 20_000_000,
+        'peak_lr': 3e-4,
+        'use_checkpoint': True,
+    },
     'S2': {
         'name': 'S2 (55M / 50M tok)',
         'embedding_dim': 512,
@@ -375,6 +388,8 @@ def create_wave_model(vocab_size, cfg, device):
     # V4.7: GLA layers — replace specific layers with Gated Linear Attention
     gla_layers_str = os.environ.get('GLA_LAYERS', '').strip()
     gla_layers = [int(x) for x in gla_layers_str.split(',') if x.strip().isdigit()]
+    # Hymba-style mixed heads: N attention heads per wave layer
+    n_attn_heads = int(os.environ.get('ATTN_HEADS', '') or '0')
     model = WaveFieldTransformer(
         vocab_size=vocab_size,
         embedding_dim=cfg['embedding_dim'],
@@ -390,12 +405,13 @@ def create_wave_model(vocab_size, cfg, device):
         n_frozen_heads=n_frozen_heads,
         hybrid_attention_layers=hybrid_layers if hybrid_layers else None,
         gla_layers=gla_layers if gla_layers else None,
+        n_attn_heads=n_attn_heads,
         device=device,
     ).to(device)
-    if n_frozen_heads > 0 or hybrid_layers or gla_layers:
-        print(f"  Wave config: n_frozen_heads={n_frozen_heads}, "
-              f"hybrid_layers={hybrid_layers or 'none'}, "
-              f"gla_layers={gla_layers or 'none'}")
+    print(f"  Wave config: n_frozen_heads={n_frozen_heads}, "
+          f"hybrid_layers={hybrid_layers or 'none'}, "
+          f"gla_layers={gla_layers or 'none'}, "
+          f"n_attn_heads={n_attn_heads}")
     return model
 
 
@@ -511,22 +527,24 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
             wb_run = None
 
     n_params = sum(p.numel() for p in model.parameters())
-    # torch.compile: only for large models (>=50M) WITHOUT gradient checkpointing
-    # (compiled submodules inside checkpointed layers cause recompilation storms/crashes)
-    use_ckpt = getattr(model, 'use_checkpoint', False)
-    if torch.cuda.is_available() and n_params >= 50_000_000 and hasattr(model, 'compile_model') and not use_ckpt:
+    # torch.compile: compile FFN, norms, feature maps (safe submodules).
+    # FFT path is NOT compiled (complex tensor support missing in Inductor).
+    # Safe with gradient checkpointing when using use_reentrant=False.
+    skip_compile = os.environ.get('TORCH_COMPILE', '1') == '0'
+    if not skip_compile and torch.cuda.is_available() and hasattr(model, 'compile_model'):
         try:
             model.compile_model(mode='default')
             print("  torch.compile: enabled (default mode)")
         except Exception as e:
             print(f"  torch.compile: skipped ({e})")
     else:
-        reason = f"{n_params/1e6:.0f}M params < 50M" if n_params < 50_000_000 else "checkpoint=True (incompatible)"
+        reason = "disabled via TORCH_COMPILE=0" if skip_compile else "no CUDA or no compile_model"
         print(f"  torch.compile: skipped ({reason})")
 
-    # V4.3.2: Use per-group LR optimizer if available (kernel params at 50x LR)
+    # V4.3.2: Use per-group LR optimizer if available (kernel params at Nx LR)
+    kernel_lr_mult = float(os.environ.get('KERNEL_LR_MULT', '50.0'))
     if hasattr(model, 'configure_optimizer'):
-        optimizer = model.configure_optimizer(base_lr=peak_lr, kernel_lr_mult=50.0)
+        optimizer = model.configure_optimizer(base_lr=peak_lr, kernel_lr_mult=kernel_lr_mult)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=peak_lr, weight_decay=0.01, eps=1e-8)
     # V4.5.0: 20% warmup (was 10%). Kernel params (50x LR) destabilize during
@@ -618,11 +636,21 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
                 # Monitor: full snapshot (gradients still alive before next zero_grad)
                 # Save incrementally so data survives crashes/stops
                 if monitor:
-                    monitor.snapshot(step, sample_input=x[:2])
-                    try:
-                        monitor.save_report()
-                    except Exception:
-                        pass
+                    # MONITOR_SNAPSHOTS: '0'=off, '3'=start/mid/end only, '1'=all (default)
+                    snap_mode = os.environ.get('MONITOR_SNAPSHOTS', '1')
+                    do_snap = True
+                    if snap_mode == '0':
+                        do_snap = False
+                    elif snap_mode == '3':
+                        # Only at ~start (step 0-1), ~middle, ~end
+                        progress = tokens_seen / total_token_budget
+                        do_snap = step == 0 or abs(progress - 0.5) < 0.03 or progress > 0.95
+                    if do_snap:
+                        monitor.snapshot(step, sample_input=x[:2])
+                        try:
+                            monitor.save_report()
+                        except Exception:
+                            pass
                 vl, vp, va = evaluate(model, val_data, batch_size, vocab_size, device, use_amp)
                 elapsed = time.time() - t0
                 tps = tokens_seen / elapsed
@@ -748,6 +776,9 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = device.type == 'cuda'
+    # TF32: use tensor cores for float32 matmuls (Ampere+). ~2x faster, <0.1% precision loss.
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
     print(f"  Device: {device}")
     if device.type == 'cuda':
         gpu_name = torch.cuda.get_device_name(0)
@@ -1053,9 +1084,37 @@ def main():
     plot_results(all_results, scale_keys, plots_dir, dataset_name)
 
     # ============================================================
-    # INFERENCE TEST (if wave checkpoint exists)
+    # INFERENCE TEST (if wave checkpoint exists) — failsafe wrapper
     # ============================================================
-    run_inference_test(all_results, scale_keys, vocab_size, tok, device, ckpts_dir)
+    # Parse hybrid/GLA config from env (same as create_wave_model)
+    _hl_str = os.environ.get('HYBRID_LAYERS', '').strip()
+    _hl = [int(x) for x in _hl_str.split(',') if x.strip().isdigit()] or None
+    _gl_str = os.environ.get('GLA_LAYERS', '').strip()
+    _gl = [int(x) for x in _gl_str.split(',') if x.strip().isdigit()] or None
+    _na = int(os.environ.get('ATTN_HEADS', '') or '0')
+    try:
+        run_inference_test(all_results, scale_keys, vocab_size, tok, device, ckpts_dir,
+                           hybrid_attention_layers=_hl, gla_layers=_gl, n_attn_heads=_na)
+    except Exception as e:
+        print(f"\n  Inference test failed (non-fatal): {e}")
+        traceback.print_exc()
+
+    # ============================================================
+    # FULL EVALUATION (gap analysis + generation comparison + dashboard)
+    # ============================================================
+    if os.environ.get('FULL_EVAL', '1') != '0':
+        try:
+            import subprocess
+            print(f"\n{'='*72}")
+            print(f"  Running full post-training evaluation...")
+            print(f"{'='*72}")
+            subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__),
+                           '..', 'scripts', 'full_eval.py'),
+                           '--scale', scale_keys[0],
+                           '--results-dir', results_dir], check=False)
+        except Exception as e:
+            print(f"  Full eval failed: {e}")
+            traceback.print_exc()
 
 
 # ======================================================================
@@ -1229,7 +1288,8 @@ def plot_results(all_results, scale_keys, results_dir, dataset_name):
 # INFERENCE TEST
 # ======================================================================
 
-def run_inference_test(all_results, scale_keys, vocab_size, tok, device, results_dir):
+def run_inference_test(all_results, scale_keys, vocab_size, tok, device, results_dir,
+                       hybrid_attention_layers=None, gla_layers=None, n_attn_heads=0):
     """Load best wave checkpoint and generate sample text."""
     import torch.nn.functional as F
 
@@ -1266,6 +1326,9 @@ def run_inference_test(all_results, scale_keys, vocab_size, tok, device, results
         interference_interval=3,
         n_components=1,
         device=device,
+        hybrid_attention_layers=hybrid_attention_layers,
+        gla_layers=gla_layers,
+        n_attn_heads=n_attn_heads,
     ).to(device)
 
     state = torch.load(ckpt_path, map_location=device, weights_only=True)
